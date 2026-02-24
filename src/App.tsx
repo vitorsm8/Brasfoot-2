@@ -7,14 +7,17 @@ import React, { useState, useMemo } from 'react';
 import { generateInitialState } from './data';
 import { GameState, Team, Player, Match } from './types';
 import { simulateMatch, getBestLineup } from './engine';
-import { Trophy, Users, Calendar, Play, Activity, Shield, Sword, Goal, Dumbbell, User, DollarSign, Home } from 'lucide-react';
+import { Trophy, Users, Calendar, Play, Activity, Shield, Sword, Goal, Dumbbell, User, DollarSign, Home, ShoppingCart } from 'lucide-react';
 import LiveMatchDay from './LiveMatchDay';
 
 export default function App() {
   const [gameState, setGameState] = useState<GameState | null>(null);
-  const [activeTab, setActiveTab] = useState<'squad' | 'standings' | 'fixtures' | 'training' | 'manager' | 'finances' | 'stadium'>('squad');
+  const [activeTab, setActiveTab] = useState<'squad' | 'standings' | 'fixtures' | 'training' | 'manager' | 'finances' | 'stadium' | 'market'>('squad');
   const [matchResult, setMatchResult] = useState<Match | null>(null);
   const [isLiveMatchMode, setIsLiveMatchMode] = useState(false);
+  const [negotiatingPlayer, setNegotiatingPlayer] = useState<Player | null>(null);
+  const [offerAmount, setOfferAmount] = useState<number>(0);
+  const [negotiationMessage, setNegotiationMessage] = useState<string>('');
 
   const startGame = (teamId: string) => {
     const initialState = generateInitialState();
@@ -243,6 +246,88 @@ export default function App() {
     });
   };
 
+  const buyPlayer = (playerId: string, amount: number) => {
+    setGameState(prev => {
+      if (!prev) return prev;
+      const player = prev.players.find(p => p.id === playerId);
+      const userTeam = prev.teams.find(t => t.id === prev.userTeamId);
+      const sellerTeam = prev.teams.find(t => t.id === player?.teamId);
+      
+      if (!player || !userTeam || !sellerTeam || userTeam.money < amount || !player.listedForSale) return prev;
+
+      const newTeams = prev.teams.map(t => {
+        if (t.id === userTeam.id) {
+          const newFinances = [...t.finances, {
+            id: Math.random().toString(),
+            round: prev.currentRound,
+            type: 'expense' as const,
+            category: 'transfer' as const,
+            amount: amount,
+            description: `Compra de ${player.name}`
+          }];
+          return { ...t, money: t.money - amount, finances: newFinances };
+        }
+        if (t.id === sellerTeam.id) {
+          const newFinances = [...t.finances, {
+            id: Math.random().toString(),
+            round: prev.currentRound,
+            type: 'income' as const,
+            category: 'transfer' as const,
+            amount: amount,
+            description: `Venda de ${player.name}`
+          }];
+          return { ...t, money: t.money + amount, finances: newFinances };
+        }
+        return t;
+      });
+
+      const newPlayers = prev.players.map(p => {
+        if (p.id === playerId) {
+          return { ...p, teamId: userTeam.id, listedForSale: false };
+        }
+        return p;
+      });
+
+      return { ...prev, teams: newTeams, players: newPlayers };
+    });
+  };
+
+  const openNegotiation = (player: Player) => {
+    setNegotiatingPlayer(player);
+    setOfferAmount(player.value);
+    setNegotiationMessage('');
+  };
+
+  const submitOffer = () => {
+    if (!negotiatingPlayer || !gameState) return;
+    const userTeam = gameState.teams.find(t => t.id === gameState.userTeamId);
+    if (!userTeam || userTeam.money < offerAmount) {
+      setNegotiationMessage('Saldo insuficiente.');
+      return;
+    }
+
+    const minAcceptable = negotiatingPlayer.value * (0.9 + Math.random() * 0.15);
+    if (offerAmount >= minAcceptable) {
+      buyPlayer(negotiatingPlayer.id, offerAmount);
+      setNegotiatingPlayer(null);
+    } else {
+      setNegotiationMessage('A oferta foi recusada pelo clube. Eles esperam um valor maior.');
+    }
+  };
+
+  const toggleListPlayer = (playerId: string) => {
+    setGameState(prev => {
+      if (!prev) return prev;
+      const newPlayers = prev.players.map(p => {
+        if (p.id === playerId) {
+          return { ...p, listedForSale: !p.listedForSale };
+        }
+        return p;
+      });
+      return { ...prev, players: newPlayers };
+    });
+  };
+
   const trainPlayer = (playerId: string) => {
     setGameState(prev => {
       if (!prev) return prev;
@@ -418,6 +503,13 @@ export default function App() {
             <User size={20} />
             <span className="font-medium">Técnico</span>
           </button>
+          <button 
+            onClick={() => setActiveTab('market')}
+            className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-colors whitespace-nowrap ${activeTab === 'market' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:bg-zinc-800/50'}`}
+          >
+            <ShoppingCart size={20} />
+            <span className="font-medium">Mercado</span>
+          </button>
         </div>
 
         {/* Content Area */}
@@ -472,8 +564,9 @@ export default function App() {
                       <th className="p-4 font-medium text-center">Energia</th>
                       <th className="p-4 font-medium text-center">Moral</th>
                       <th className="p-4 font-medium text-center">Salário</th>
+                      <th className="p-4 font-medium text-center">Valor</th>
                       <th className="p-4 font-medium text-center">Cartões</th>
-                      <th className="p-4 font-medium text-right">Escalar</th>
+                      <th className="p-4 font-medium text-right">Ação</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-zinc-800/50">
@@ -526,6 +619,9 @@ export default function App() {
                           <td className="p-4 text-center text-zinc-400 font-mono text-xs">
                             R$ {(player.salary / 1000).toFixed(0)}k
                           </td>
+                          <td className="p-4 text-center text-zinc-400 font-mono text-xs">
+                            R$ {(player.value / 1000000).toFixed(1)}M
+                          </td>
                           <td className="p-4 text-center">
                             <div className="flex items-center justify-center gap-1">
                               {player.redCard && <div className="w-3 h-4 bg-red-500 rounded-sm"></div>}
@@ -535,10 +631,18 @@ export default function App() {
                             </div>
                           </td>
                           <td className="p-4 text-right">
-                            <div className={`w-6 h-6 rounded-full border-2 inline-flex items-center justify-center transition-colors
-                              ${isSelected ? 'bg-emerald-500 border-emerald-500' : isSuspended ? 'border-zinc-800 bg-zinc-900' : 'border-zinc-600'}
-                            `}>
-                              {isSelected && <div className="w-2 h-2 bg-zinc-950 rounded-full" />}
+                            <div className="flex items-center justify-end gap-2">
+                              <button 
+                                onClick={(e) => { e.stopPropagation(); toggleListPlayer(player.id); }}
+                                className={`text-xs font-bold py-1 px-3 rounded-lg transition-colors border ${player.listedForSale ? 'bg-amber-500/20 text-amber-400 border-amber-500/50 hover:bg-amber-500/30' : 'bg-zinc-800 text-zinc-400 border-zinc-700 hover:bg-zinc-700'}`}
+                              >
+                                {player.listedForSale ? 'À Venda' : 'Vender'}
+                              </button>
+                              <div className={`w-6 h-6 rounded-full border-2 inline-flex items-center justify-center transition-colors
+                                ${isSelected ? 'bg-emerald-500 border-emerald-500' : isSuspended ? 'border-zinc-800 bg-zinc-900' : 'border-zinc-600'}
+                              `}>
+                                {isSelected && <div className="w-2 h-2 bg-zinc-950 rounded-full" />}
+                              </div>
                             </div>
                           </td>
                         </tr>
@@ -890,8 +994,144 @@ export default function App() {
             </div>
           )}
 
+          {activeTab === 'market' && (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden p-6">
+              <div className="flex justify-between items-center mb-6">
+                <h3 className="font-bold text-lg flex items-center gap-2">
+                  <ShoppingCart size={20} className="text-amber-400" />
+                  Mercado de Transferências
+                </h3>
+                <div className="text-sm">
+                  Orçamento: <span className="text-emerald-400 font-bold font-mono text-lg">R$ {(userTeam.money / 1000000).toFixed(2)}M</span>
+                </div>
+              </div>
+              
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-zinc-950 text-zinc-500">
+                    <tr>
+                      <th className="p-3 font-medium w-12">Pos</th>
+                      <th className="p-3 font-medium">Nome</th>
+                      <th className="p-3 font-medium">Time</th>
+                      <th className="p-3 font-medium text-center">Idade</th>
+                      <th className="p-3 font-medium text-center">Força</th>
+                      <th className="p-3 font-medium text-center">Valor</th>
+                      <th className="p-3 font-medium text-right">Ação</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-800/50">
+                    {gameState.players.filter(p => p.teamId !== userTeam.id && p.listedForSale).map(player => {
+                      const team = gameState.teams.find(t => t.id === player.teamId);
+                      return (
+                        <tr key={player.id} className="hover:bg-zinc-800/30">
+                          <td className="p-3">
+                            <span className={`inline-flex items-center justify-center w-8 h-8 rounded-lg font-bold text-xs
+                              ${player.position === 'G' ? 'bg-amber-500/20 text-amber-400' : ''}
+                              ${player.position === 'D' ? 'bg-blue-500/20 text-blue-400' : ''}
+                              ${player.position === 'M' ? 'bg-emerald-500/20 text-emerald-400' : ''}
+                              ${player.position === 'A' ? 'bg-red-500/20 text-red-400' : ''}
+                            `}>
+                              {player.position}
+                            </span>
+                          </td>
+                          <td className="p-3 font-medium">{player.name}</td>
+                          <td className="p-3 text-zinc-400">{team?.name}</td>
+                          <td className="p-3 text-center text-zinc-400">{player.age}</td>
+                          <td className="p-3 text-center">
+                            <span className="font-mono bg-zinc-950 px-2 py-1 rounded text-zinc-300 border border-zinc-800">{player.strength}</span>
+                          </td>
+                          <td className="p-3 text-center font-mono font-bold text-amber-400">
+                            R$ {(player.value / 1000000).toFixed(1)}M
+                          </td>
+                          <td className="p-3 text-right">
+                            <button 
+                              onClick={() => openNegotiation(player)}
+                              className="bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold py-1.5 px-4 rounded-lg transition-colors text-xs"
+                            >
+                              Negociar
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {gameState.players.filter(p => p.teamId !== userTeam.id && p.listedForSale).length === 0 && (
+                      <tr>
+                        <td colSpan={7} className="p-6 text-center text-zinc-500">Nenhum jogador à venda no momento.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
         </div>
       </main>
+
+      {/* Negotiation Modal */}
+      {negotiatingPlayer && (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-md w-full">
+            <h3 className="text-xl font-bold mb-4">Negociar Transferência</h3>
+            
+            <div className="flex items-center gap-4 mb-6 bg-zinc-950 p-4 rounded-xl border border-zinc-800">
+              <div className={`w-12 h-12 rounded-full flex items-center justify-center font-bold text-lg
+                ${negotiatingPlayer.position === 'G' ? 'bg-amber-500/20 text-amber-400' : ''}
+                ${negotiatingPlayer.position === 'D' ? 'bg-blue-500/20 text-blue-400' : ''}
+                ${negotiatingPlayer.position === 'M' ? 'bg-emerald-500/20 text-emerald-400' : ''}
+                ${negotiatingPlayer.position === 'A' ? 'bg-red-500/20 text-red-400' : ''}
+              `}>
+                {negotiatingPlayer.position}
+              </div>
+              <div>
+                <div className="font-bold text-lg">{negotiatingPlayer.name}</div>
+                <div className="text-zinc-400 text-sm">
+                  {gameState.teams.find(t => t.id === negotiatingPlayer.teamId)?.name} • {negotiatingPlayer.age} anos • Força {negotiatingPlayer.strength}
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-4 mb-6">
+              <div>
+                <label className="block text-xs font-bold text-zinc-500 uppercase tracking-wider mb-1">Valor de Mercado</label>
+                <div className="font-mono text-lg text-amber-400">R$ {(negotiatingPlayer.value / 1000000).toFixed(2)}M</div>
+              </div>
+              
+              <div>
+                <label className="block text-xs font-bold text-zinc-500 uppercase tracking-wider mb-1">Sua Oferta (R$)</label>
+                <input 
+                  type="number" 
+                  value={offerAmount}
+                  onChange={(e) => setOfferAmount(Number(e.target.value))}
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-white font-mono focus:outline-none focus:border-emerald-500 transition-colors"
+                />
+              </div>
+
+              {negotiationMessage && (
+                <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-sm">
+                  {negotiationMessage}
+                </div>
+              )}
+            </div>
+
+            <div className="flex gap-3">
+              <button 
+                onClick={() => setNegotiatingPlayer(null)}
+                className="flex-1 py-3 rounded-xl font-bold transition-colors bg-zinc-800 hover:bg-zinc-700 text-white"
+              >
+                Cancelar
+              </button>
+              <button 
+                onClick={submitOffer}
+                className="flex-1 py-3 rounded-xl font-bold transition-colors bg-emerald-500 hover:bg-emerald-400 text-zinc-950"
+              >
+                Fazer Oferta
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

@@ -25,6 +25,8 @@ export interface Player {
   trainingProgress: number; // 0 to 100, when 100 strength increases
   morale: number; // 0 to 100
   salary: number;
+  value: number;
+  listedForSale: boolean;
 }
 
 export interface Stadium {
@@ -38,7 +40,7 @@ export interface FinanceRecord {
   id: string;
   round: number;
   type: 'income' | 'expense';
-  category: 'tickets' | 'sponsorship' | 'salaries' | 'maintenance' | 'training' | 'stadium_upgrade';
+  category: 'tickets' | 'sponsorship' | 'salaries' | 'maintenance' | 'training' | 'stadium_upgrade' | 'transfer';
   amount: number;
   description: string;
 }

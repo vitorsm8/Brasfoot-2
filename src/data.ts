@@ -30,14 +30,21 @@ function generatePlayersForTeam(teamId: string): Player[] {
   
   positions.forEach((pos, index) => {
     const strength = Math.floor(Math.random() * 40) + 60; // 60 to 99
+    const age = Math.floor(Math.random() * 15) + 18; // 18 to 32
     const salary = Math.floor((strength - 50) * 10000); // Base salary calculation
     
+    // Value calculation based on strength and age
+    let baseValue = (strength - 50) * 500000;
+    if (age < 23) baseValue *= 1.5;
+    else if (age > 28) baseValue *= 0.7;
+    const value = Math.floor(baseValue);
+
     players.push({
       id: `${teamId}-p${index}`,
       name: randomName(),
       position: pos,
       strength,
-      age: Math.floor(Math.random() * 15) + 18, // 18 to 32
+      age,
       teamId,
       energy: 100,
       yellowCards: 0,
@@ -48,6 +55,8 @@ function generatePlayersForTeam(teamId: string): Player[] {
       trainingProgress: 0,
       morale: 80, // Initial morale
       salary,
+      value,
+      listedForSale: Math.random() < 0.1, // 10% chance to be listed initially
     });
   });
   return players;
