@@ -1,4 +1,4 @@
-import { Team, Player, Match } from './types';
+import { Team, Player, Match, GameState } from './types';
 
 const TEAM_NAMES = [
   'Flamengo', 'Palmeiras', 'São Paulo', 'Corinthians',
@@ -29,11 +29,14 @@ function generatePlayersForTeam(teamId: string): Player[] {
   ];
   
   positions.forEach((pos, index) => {
+    const strength = Math.floor(Math.random() * 40) + 60; // 60 to 99
+    const salary = Math.floor((strength - 50) * 10000); // Base salary calculation
+    
     players.push({
       id: `${teamId}-p${index}`,
       name: randomName(),
       position: pos,
-      strength: Math.floor(Math.random() * 40) + 60, // 60 to 99
+      strength,
       age: Math.floor(Math.random() * 15) + 18, // 18 to 32
       teamId,
       energy: 100,
@@ -43,17 +46,27 @@ function generatePlayersForTeam(teamId: string): Player[] {
       goals: 0,
       assists: 0,
       trainingProgress: 0,
+      morale: 80, // Initial morale
+      salary,
     });
   });
   return players;
 }
 
-export function generateInitialState() {
+export function generateInitialState(): Omit<GameState, 'userTeamId' | 'userLineup' | 'currentRound'> {
   const teams: Team[] = TEAM_NAMES.map((name, index) => ({
     id: `t${index}`,
     name,
     color: COLORS[index],
     money: 10000000,
+    stadium: {
+      level: 1,
+      capacity: 20000 + Math.floor(Math.random() * 10000),
+      ticketPrice: 50,
+      maintenanceCost: 50000,
+    },
+    finances: [],
+    sponsorshipIncome: 200000 + Math.floor(Math.random() * 100000),
   }));
 
   let players: Player[] = [];
@@ -99,5 +112,19 @@ export function generateInitialState() {
     });
   });
 
-  return { teams, players, matches };
+  return { 
+    teams, 
+    players, 
+    matches,
+    manager: {
+      name: 'Manager',
+      nationality: 'Brasil',
+      reputation: 50,
+      matchesManaged: 0,
+      wins: 0,
+      draws: 0,
+      losses: 0,
+      titles: 0
+    }
+  };
 }

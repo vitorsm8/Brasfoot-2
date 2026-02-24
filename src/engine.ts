@@ -1,7 +1,9 @@
 import { Match, Player } from './types';
 
 export function getEffectiveStrength(player: Player): number {
-  return Math.round(player.strength * (0.5 + player.energy / 200));
+  const energyFactor = 0.5 + player.energy / 200; // 0.5 to 1.0
+  const moraleFactor = 0.8 + (player.morale / 100) * 0.4; // 0.8 to 1.2
+  return Math.round(player.strength * energyFactor * moraleFactor);
 }
 
 export function getBestLineup(players: Player[]): Player[] {

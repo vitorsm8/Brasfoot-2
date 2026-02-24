@@ -132,20 +132,31 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
           newHomeScore++;
           const scorer = pickPlayer(homePlayersOnPitch, true);
           if (scorer) newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'goal', teamId: lm.match.homeTeamId, playerId: scorer.id });
+        } else if (Math.random() < homeChance * 3) {
+          const player = pickPlayer(homePlayersOnPitch, true);
+          if (player) newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'chance', teamId: lm.match.homeTeamId, playerId: player.id });
         }
+
         if (Math.random() < awayChance) {
           newAwayScore++;
           const scorer = pickPlayer(awayPlayersOnPitch, true);
           if (scorer) newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'goal', teamId: lm.match.awayTeamId, playerId: scorer.id });
+        } else if (Math.random() < awayChance * 3) {
+          const player = pickPlayer(awayPlayersOnPitch, true);
+          if (player) newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'chance', teamId: lm.match.awayTeamId, playerId: player.id });
         }
 
-        // Cards and Energy
+        // Cards, Energy, Fouls
         setLivePlayers(prevPlayers => {
           const nextPlayers = { ...prevPlayers };
           [...homePlayersOnPitch, ...awayPlayersOnPitch].forEach(p => {
             // Energy drops by ~0.2 to 0.4 per minute
             if (Math.random() < 0.3) {
               nextPlayers[p.id] = { ...nextPlayers[p.id], energy: Math.max(0, nextPlayers[p.id].energy - 1) };
+            }
+            // Fouls
+            if (Math.random() < 0.01) {
+              newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'foul', teamId: p.teamId, playerId: p.id });
             }
             // Cards
             if (Math.random() < 0.002) {
@@ -339,23 +350,40 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
         <div className="lg:col-span-3 flex flex-col gap-6">
           
           {/* Scoreboard */}
-          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-8 flex items-center justify-between">
-            <div className="flex-1 flex flex-col items-center gap-4">
-              <div className="w-24 h-24 rounded-full flex items-center justify-center text-4xl font-bold shadow-lg" style={{ backgroundColor: isHome ? userTeam.color : opponentTeam.color, color: '#fff' }}>
-                {(isHome ? userTeam.name : opponentTeam.name).charAt(0)}
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-8 flex flex-col items-center justify-between">
+            <div className="flex w-full items-center justify-between mb-8">
+              <div className="flex-1 flex flex-col items-center gap-4">
+                <div className="w-24 h-24 rounded-full flex items-center justify-center text-4xl font-bold shadow-lg" style={{ backgroundColor: isHome ? userTeam.color : opponentTeam.color, color: '#fff' }}>
+                  {(isHome ? userTeam.name : opponentTeam.name).charAt(0)}
+                </div>
+                <h2 className="text-xl font-bold text-center">{isHome ? userTeam.name : opponentTeam.name}</h2>
               </div>
-              <h2 className="text-xl font-bold text-center">{isHome ? userTeam.name : opponentTeam.name}</h2>
-            </div>
-            
-            <div className="px-8 text-6xl font-black font-mono tabular-nums tracking-tighter">
-              {userMatch.homeScore} - {userMatch.awayScore}
-            </div>
-            
-            <div className="flex-1 flex flex-col items-center gap-4">
-              <div className="w-24 h-24 rounded-full flex items-center justify-center text-4xl font-bold shadow-lg" style={{ backgroundColor: !isHome ? userTeam.color : opponentTeam.color, color: '#fff' }}>
-                {(!isHome ? userTeam.name : opponentTeam.name).charAt(0)}
+              
+              <div className="px-8 text-6xl font-black font-mono tabular-nums tracking-tighter">
+                {userMatch.homeScore} - {userMatch.awayScore}
               </div>
-              <h2 className="text-xl font-bold text-center">{!isHome ? userTeam.name : opponentTeam.name}</h2>
+              
+              <div className="flex-1 flex flex-col items-center gap-4">
+                <div className="w-24 h-24 rounded-full flex items-center justify-center text-4xl font-bold shadow-lg" style={{ backgroundColor: !isHome ? userTeam.color : opponentTeam.color, color: '#fff' }}>
+                  {(!isHome ? userTeam.name : opponentTeam.name).charAt(0)}
+                </div>
+                <h2 className="text-xl font-bold text-center">{!isHome ? userTeam.name : opponentTeam.name}</h2>
+              </div>
+            </div>
+
+            {/* Match Stats */}
+            <div className="w-full max-w-md grid grid-cols-3 gap-y-4 text-sm">
+              <div className="text-center font-bold">{userMatch.events.filter(e => e.teamId === (isHome ? userTeam.id : opponentTeam.id) && e.type === 'chance').length}</div>
+              <div className="text-center text-zinc-500 uppercase text-xs tracking-wider">Chances</div>
+              <div className="text-center font-bold">{userMatch.events.filter(e => e.teamId === (!isHome ? userTeam.id : opponentTeam.id) && e.type === 'chance').length}</div>
+
+              <div className="text-center font-bold">{userMatch.events.filter(e => e.teamId === (isHome ? userTeam.id : opponentTeam.id) && e.type === 'foul').length}</div>
+              <div className="text-center text-zinc-500 uppercase text-xs tracking-wider">Faltas</div>
+              <div className="text-center font-bold">{userMatch.events.filter(e => e.teamId === (!isHome ? userTeam.id : opponentTeam.id) && e.type === 'foul').length}</div>
+
+              <div className="text-center font-bold text-amber-400">{userMatch.events.filter(e => e.teamId === (isHome ? userTeam.id : opponentTeam.id) && e.type === 'yellow').length}</div>
+              <div className="text-center text-zinc-500 uppercase text-xs tracking-wider">Amarelos</div>
+              <div className="text-center font-bold text-amber-400">{userMatch.events.filter(e => e.teamId === (!isHome ? userTeam.id : opponentTeam.id) && e.type === 'yellow').length}</div>
             </div>
           </div>
 
@@ -374,6 +402,8 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
                       {event.type === 'yellow' && <div className="w-3 h-4 bg-amber-400 rounded-sm"></div>}
                       {event.type === 'red' && <div className="w-3 h-4 bg-red-500 rounded-sm"></div>}
                       {event.type === 'sub' && <ArrowRightLeft size={16} className="text-blue-400" />}
+                      {event.type === 'foul' && <span className="text-zinc-500 text-xs uppercase font-bold">Falta</span>}
+                      {event.type === 'chance' && <span className="text-blue-400 text-xs uppercase font-bold">Perigo</span>}
                       
                       <span className="font-medium">{player?.name}</span>
                       
@@ -423,11 +453,20 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
                           <span className="text-xs font-bold w-4">{p.position}</span>
                           <span className="font-medium">{p.name}</span>
                           {p.redCard && <div className="w-2 h-3 bg-red-500 rounded-sm"></div>}
+                          {!p.redCard && Array.from({ length: p.yellowCards }).map((_, i) => (
+                            <div key={i} className="w-2 h-3 bg-amber-400 rounded-sm"></div>
+                          ))}
                         </div>
                         <div className="flex items-center gap-3">
-                          <div className="flex items-center gap-1">
+                          <div className="flex items-center gap-1" title={`Moral: ${p.morale}%`}>
+                            <span className="text-xs text-zinc-400">{p.morale}%</span>
+                            <div className="w-8 h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                              <div className={`h-full ${p.morale > 60 ? 'bg-blue-500' : p.morale > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.morale}%` }}></div>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1" title={`Energia: ${p.energy}%`}>
                             <span className="text-xs text-zinc-400">{p.energy}%</span>
-                            <div className="w-12 h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                            <div className="w-8 h-1.5 bg-zinc-900 rounded-full overflow-hidden">
                               <div className={`h-full ${p.energy > 60 ? 'bg-emerald-500' : p.energy > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.energy}%` }}></div>
                             </div>
                           </div>
@@ -460,7 +499,18 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
                           <span className="font-medium">{p.name}</span>
                         </div>
                         <div className="flex items-center gap-3">
-                          <span className="text-xs text-zinc-400">{p.energy}%</span>
+                          <div className="flex items-center gap-1" title={`Moral: ${p.morale}%`}>
+                            <span className="text-xs text-zinc-400">{p.morale}%</span>
+                            <div className="w-8 h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                              <div className={`h-full ${p.morale > 60 ? 'bg-blue-500' : p.morale > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.morale}%` }}></div>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1" title={`Energia: ${p.energy}%`}>
+                            <span className="text-xs text-zinc-400">{p.energy}%</span>
+                            <div className="w-8 h-1.5 bg-zinc-900 rounded-full overflow-hidden">
+                              <div className={`h-full ${p.energy > 60 ? 'bg-emerald-500' : p.energy > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.energy}%` }}></div>
+                            </div>
+                          </div>
                           <span className="font-mono text-xs bg-zinc-950 px-1.5 py-0.5 rounded text-zinc-400">{p.strength}</span>
                         </div>
                       </div>

@@ -7,12 +7,12 @@ import React, { useState, useMemo } from 'react';
 import { generateInitialState } from './data';
 import { GameState, Team, Player, Match } from './types';
 import { simulateMatch, getBestLineup } from './engine';
-import { Trophy, Users, Calendar, Play, Activity, Shield, Sword, Goal, Dumbbell } from 'lucide-react';
+import { Trophy, Users, Calendar, Play, Activity, Shield, Sword, Goal, Dumbbell, User, DollarSign, Home } from 'lucide-react';
 import LiveMatchDay from './LiveMatchDay';
 
 export default function App() {
   const [gameState, setGameState] = useState<GameState | null>(null);
-  const [activeTab, setActiveTab] = useState<'squad' | 'standings' | 'fixtures' | 'training'>('squad');
+  const [activeTab, setActiveTab] = useState<'squad' | 'standings' | 'fixtures' | 'training' | 'manager' | 'finances' | 'stadium'>('squad');
   const [matchResult, setMatchResult] = useState<Match | null>(null);
   const [isLiveMatchMode, setIsLiveMatchMode] = useState(false);
 
@@ -77,11 +77,40 @@ export default function App() {
   };
 
   const handleMatchDayComplete = (updatedMatches: Match[], playerUpdates: Partial<Player>[]) => {
+    const userTeam = gameState!.teams.find(t => t.id === gameState!.userTeamId)!;
+    const userMatch = updatedMatches.find(m => m.homeTeamId === userTeam.id || m.awayTeamId === userTeam.id)!;
+    
+    let isWin = false;
+    let isDraw = false;
+    let isLoss = false;
+    if (userMatch.homeTeamId === userTeam.id) {
+      if (userMatch.homeScore > userMatch.awayScore) isWin = true;
+      else if (userMatch.homeScore === userMatch.awayScore) isDraw = true;
+      else isLoss = true;
+    } else {
+      if (userMatch.awayScore > userMatch.homeScore) isWin = true;
+      else if (userMatch.awayScore === userMatch.homeScore) isDraw = true;
+      else isLoss = true;
+    }
+
     let nextPlayers = gameState!.players.map(p => {
       // Default: rest and recover energy, clear red card if they were suspended
       let newEnergy = Math.min(100, p.energy + 20);
       let newRedCard = p.redCard ? false : p.redCard; // served suspension
-      return { ...p, energy: newEnergy, redCard: newRedCard };
+      
+      // Morale update
+      let moraleChange = 0;
+      if (p.teamId === userTeam.id) {
+        if (isWin) moraleChange += 5;
+        if (isLoss) moraleChange -= 5;
+        // If they played, boost morale slightly, if they didn't, drop slightly
+        const played = playerUpdates.find(pu => pu.id === p.id)?.matchesPlayed !== undefined;
+        if (played) moraleChange += 2;
+        else moraleChange -= 2;
+      }
+      let newMorale = Math.max(0, Math.min(100, p.morale + moraleChange));
+
+      return { ...p, energy: newEnergy, redCard: newRedCard, morale: newMorale };
     });
 
     // Apply updates to nextPlayers
@@ -90,6 +119,43 @@ export default function App() {
       if (pIndex !== -1) {
         nextPlayers[pIndex] = { ...nextPlayers[pIndex], ...update };
       }
+    });
+
+    // Finances processing
+    const newTeams = gameState!.teams.map(t => {
+      const tMatch = updatedMatches.find(m => m.homeTeamId === t.id || m.awayTeamId === t.id);
+      if (!tMatch) return t;
+
+      let newMoney = t.money;
+      const newFinances = [...t.finances];
+      const round = gameState!.currentRound;
+
+      // Income: Ticket sales (only for home team)
+      if (tMatch.homeTeamId === t.id) {
+        // Simple attendance calculation based on stadium capacity and a random factor
+        const attendance = Math.floor(t.stadium.capacity * (0.5 + Math.random() * 0.5));
+        const ticketIncome = attendance * t.stadium.ticketPrice;
+        newMoney += ticketIncome;
+        newFinances.push({ id: Math.random().toString(), round, type: 'income', category: 'tickets', amount: ticketIncome, description: `Bilheteria (${attendance} pagantes)` });
+      }
+
+      // Income: Sponsorship (per match)
+      const sponsorship = Math.floor(t.sponsorshipIncome / 38); // Assuming 38 matches
+      newMoney += sponsorship;
+      newFinances.push({ id: Math.random().toString(), round, type: 'income', category: 'sponsorship', amount: sponsorship, description: 'Patrocínio' });
+
+      // Expense: Salaries (per match)
+      const teamPlayers = nextPlayers.filter(p => p.teamId === t.id);
+      const totalSalaries = teamPlayers.reduce((sum, p) => sum + p.salary, 0) / 4; // Weekly/per match
+      newMoney -= totalSalaries;
+      newFinances.push({ id: Math.random().toString(), round, type: 'expense', category: 'salaries', amount: totalSalaries, description: 'Salários dos Jogadores' });
+
+      // Expense: Stadium Maintenance
+      const maintenance = t.stadium.maintenanceCost;
+      newMoney -= maintenance;
+      newFinances.push({ id: Math.random().toString(), round, type: 'expense', category: 'maintenance', amount: maintenance, description: 'Manutenção do Estádio' });
+
+      return { ...t, money: newMoney, finances: newFinances };
     });
 
     const newMatches = gameState!.matches.map(m => {
@@ -106,12 +172,27 @@ export default function App() {
       return p && !p.redCard;
     });
 
+    // Update Manager Stats
+    const newManager = { ...gameState!.manager };
+    newManager.matchesManaged++;
+    if (isWin) {
+      newManager.wins++;
+      newManager.reputation = Math.min(100, newManager.reputation + 1);
+    } else if (isDraw) {
+      newManager.draws++;
+    } else if (isLoss) {
+      newManager.losses++;
+      newManager.reputation = Math.max(0, newManager.reputation - 1);
+    }
+
     setGameState(prev => ({
       ...prev!,
       players: nextPlayers,
+      teams: newTeams,
       matches: newMatches,
       currentRound: prev!.currentRound + 1,
-      userLineup: newUserLineup
+      userLineup: newUserLineup,
+      manager: newManager
     }));
     setIsLiveMatchMode(false);
   };
@@ -119,6 +200,48 @@ export default function App() {
   if (isLiveMatchMode) {
     return <LiveMatchDay gameState={gameState!} matches={currentRoundMatches} userLineup={gameState!.userLineup} onComplete={handleMatchDayComplete} />;
   }
+
+  const upgradeStadium = () => {
+    setGameState(prev => {
+      if (!prev) return prev;
+      const userTeam = prev.teams.find(t => t.id === prev.userTeamId);
+      if (!userTeam) return prev;
+
+      const cost = userTeam.stadium.level * 2000000;
+      if (userTeam.money < cost) return prev;
+
+      const newTeams = prev.teams.map(t => {
+        if (t.id === prev.userTeamId) {
+          const newStadium = {
+            ...t.stadium,
+            level: t.stadium.level + 1,
+            capacity: t.stadium.capacity + 10000,
+            ticketPrice: t.stadium.ticketPrice + 10,
+            maintenanceCost: t.stadium.maintenanceCost + 20000
+          };
+          const newFinances = [...t.finances, {
+            id: Math.random().toString(),
+            round: prev.currentRound,
+            type: 'expense' as const,
+            category: 'stadium_upgrade' as const,
+            amount: cost,
+            description: `Ampliação do Estádio (Nível ${newStadium.level})`
+          }];
+          return { ...t, money: t.money - cost, stadium: newStadium, finances: newFinances };
+        }
+        return t;
+      });
+
+      return { ...prev, teams: newTeams };
+    });
+  };
+
+  const updateManagerProfile = (name: string, nationality: string) => {
+    setGameState(prev => {
+      if (!prev) return prev;
+      return { ...prev, manager: { ...prev.manager, name, nationality } };
+    });
+  };
 
   const trainPlayer = (playerId: string) => {
     setGameState(prev => {
@@ -274,6 +397,27 @@ export default function App() {
             <Dumbbell size={20} />
             <span className="font-medium">Treino</span>
           </button>
+          <button 
+            onClick={() => setActiveTab('finances')}
+            className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-colors whitespace-nowrap ${activeTab === 'finances' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:bg-zinc-800/50'}`}
+          >
+            <DollarSign size={20} />
+            <span className="font-medium">Finanças</span>
+          </button>
+          <button 
+            onClick={() => setActiveTab('stadium')}
+            className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-colors whitespace-nowrap ${activeTab === 'stadium' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:bg-zinc-800/50'}`}
+          >
+            <Home size={20} />
+            <span className="font-medium">Estádio</span>
+          </button>
+          <button 
+            onClick={() => setActiveTab('manager')}
+            className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-colors whitespace-nowrap ${activeTab === 'manager' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:bg-zinc-800/50'}`}
+          >
+            <User size={20} />
+            <span className="font-medium">Técnico</span>
+          </button>
         </div>
 
         {/* Content Area */}
@@ -326,6 +470,8 @@ export default function App() {
                       <th className="p-4 font-medium text-center">G</th>
                       <th className="p-4 font-medium text-center">A</th>
                       <th className="p-4 font-medium text-center">Energia</th>
+                      <th className="p-4 font-medium text-center">Moral</th>
+                      <th className="p-4 font-medium text-center">Salário</th>
                       <th className="p-4 font-medium text-center">Cartões</th>
                       <th className="p-4 font-medium text-right">Escalar</th>
                     </tr>
@@ -368,6 +514,17 @@ export default function App() {
                                 <div className={`h-2 rounded-full ${player.energy > 70 ? 'bg-emerald-500' : player.energy > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${player.energy}%` }}></div>
                               </div>
                             </div>
+                          </td>
+                          <td className="p-4 text-center">
+                            <div className="flex items-center justify-center gap-2">
+                              <span className="text-xs text-zinc-400 w-8">{player.morale}%</span>
+                              <div className="w-16 bg-zinc-800 rounded-full h-2">
+                                <div className={`h-2 rounded-full ${player.morale > 70 ? 'bg-blue-500' : player.morale > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${player.morale}%` }}></div>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="p-4 text-center text-zinc-400 font-mono text-xs">
+                            R$ {(player.salary / 1000).toFixed(0)}k
                           </td>
                           <td className="p-4 text-center">
                             <div className="flex items-center justify-center gap-1">
@@ -536,6 +693,199 @@ export default function App() {
                     ))}
                   </tbody>
                 </table>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'finances' && (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden p-6">
+              <h3 className="font-bold text-lg flex items-center gap-2 mb-6">
+                <DollarSign size={20} className="text-emerald-400" />
+                Finanças do Clube
+              </h3>
+              
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                <div className="bg-zinc-950 border border-zinc-800 rounded-xl p-4">
+                  <div className="text-zinc-500 text-sm mb-1">Saldo Atual</div>
+                  <div className="text-2xl font-bold text-emerald-400 font-mono">R$ {(userTeam.money / 1000000).toFixed(2)}M</div>
+                </div>
+                <div className="bg-zinc-950 border border-zinc-800 rounded-xl p-4">
+                  <div className="text-zinc-500 text-sm mb-1">Folha Salarial (Est.)</div>
+                  <div className="text-xl font-bold text-red-400 font-mono">R$ {(userPlayers.reduce((s, p) => s + p.salary, 0) / 1000000).toFixed(2)}M /mês</div>
+                </div>
+                <div className="bg-zinc-950 border border-zinc-800 rounded-xl p-4">
+                  <div className="text-zinc-500 text-sm mb-1">Patrocínio</div>
+                  <div className="text-xl font-bold text-blue-400 font-mono">R$ {(userTeam.sponsorshipIncome / 1000000).toFixed(2)}M /ano</div>
+                </div>
+              </div>
+
+              <h4 className="font-bold text-zinc-400 mb-4">Últimas Transações</h4>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-zinc-950 text-zinc-500">
+                    <tr>
+                      <th className="p-3 font-medium">Rodada</th>
+                      <th className="p-3 font-medium">Descrição</th>
+                      <th className="p-3 font-medium text-right">Valor</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-800/50">
+                    {userTeam.finances.slice().reverse().slice(0, 15).map(record => (
+                      <tr key={record.id} className="hover:bg-zinc-800/30">
+                        <td className="p-3 text-zinc-500">{record.round}</td>
+                        <td className="p-3">{record.description}</td>
+                        <td className={`p-3 text-right font-mono font-bold ${record.type === 'income' ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {record.type === 'income' ? '+' : '-'} R$ {(record.amount / 1000).toFixed(1)}k
+                        </td>
+                      </tr>
+                    ))}
+                    {userTeam.finances.length === 0 && (
+                      <tr>
+                        <td colSpan={3} className="p-6 text-center text-zinc-500">Nenhuma transação registrada.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'stadium' && (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden p-6">
+              <h3 className="font-bold text-lg flex items-center gap-2 mb-6">
+                <Home size={20} className="text-zinc-400" />
+                Estádio
+              </h3>
+              
+              <div className="flex flex-col md:flex-row gap-8 items-start">
+                <div className="flex-1 bg-zinc-950 border border-zinc-800 rounded-xl p-6 w-full">
+                  <div className="flex items-center justify-between mb-6">
+                    <div>
+                      <h4 className="text-xl font-bold">Nível {userTeam.stadium.level}</h4>
+                      <p className="text-zinc-500 text-sm">Estádio atual</p>
+                    </div>
+                    <div className="w-16 h-16 bg-zinc-900 rounded-full flex items-center justify-center border border-zinc-800">
+                      <Home size={24} className="text-zinc-400" />
+                    </div>
+                  </div>
+                  
+                  <div className="space-y-4">
+                    <div className="flex justify-between items-center border-b border-zinc-800/50 pb-2">
+                      <span className="text-zinc-400">Capacidade</span>
+                      <span className="font-bold font-mono">{userTeam.stadium.capacity.toLocaleString()}</span>
+                    </div>
+                    <div className="flex justify-between items-center border-b border-zinc-800/50 pb-2">
+                      <span className="text-zinc-400">Preço do Ingresso</span>
+                      <span className="font-bold font-mono text-emerald-400">R$ {userTeam.stadium.ticketPrice}</span>
+                    </div>
+                    <div className="flex justify-between items-center border-b border-zinc-800/50 pb-2">
+                      <span className="text-zinc-400">Custo de Manutenção</span>
+                      <span className="font-bold font-mono text-red-400">R$ {(userTeam.stadium.maintenanceCost / 1000).toFixed(1)}k /jogo</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex-1 bg-zinc-800/30 border border-zinc-700 rounded-xl p-6 w-full">
+                  <h4 className="text-lg font-bold mb-2">Ampliar Estádio</h4>
+                  <p className="text-zinc-400 text-sm mb-6">Melhore a infraestrutura para atrair mais torcedores e aumentar a renda.</p>
+                  
+                  <div className="space-y-2 mb-6 text-sm">
+                    <div className="flex justify-between text-zinc-300">
+                      <span>Nova Capacidade:</span>
+                      <span className="font-bold">{(userTeam.stadium.capacity + 10000).toLocaleString()}</span>
+                    </div>
+                    <div className="flex justify-between text-zinc-300">
+                      <span>Novo Preço:</span>
+                      <span className="font-bold text-emerald-400">R$ {userTeam.stadium.ticketPrice + 10}</span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between mt-auto">
+                    <div>
+                      <div className="text-xs text-zinc-500 uppercase tracking-wider">Custo da Obra</div>
+                      <div className="font-bold font-mono text-amber-400">R$ {((userTeam.stadium.level * 2000000) / 1000000).toFixed(1)}M</div>
+                    </div>
+                    <button 
+                      onClick={upgradeStadium}
+                      disabled={userTeam.money < userTeam.stadium.level * 2000000}
+                      className="bg-amber-500 hover:bg-amber-400 disabled:bg-zinc-700 disabled:text-zinc-500 text-zinc-950 font-bold py-2 px-6 rounded-lg transition-colors"
+                    >
+                      Construir
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'manager' && (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden p-6">
+              <h3 className="font-bold text-lg flex items-center gap-2 mb-6">
+                <User size={20} className="text-zinc-400" />
+                Perfil do Técnico
+              </h3>
+              
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-bold text-zinc-500 uppercase tracking-wider mb-1">Nome</label>
+                    <input 
+                      type="text" 
+                      value={gameState.manager.name}
+                      onChange={(e) => updateManagerProfile(e.target.value, gameState.manager.nationality)}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-emerald-500 transition-colors"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-zinc-500 uppercase tracking-wider mb-1">Nacionalidade</label>
+                    <input 
+                      type="text" 
+                      value={gameState.manager.nationality}
+                      onChange={(e) => updateManagerProfile(gameState.manager.name, e.target.value)}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-emerald-500 transition-colors"
+                    />
+                  </div>
+                  
+                  <div className="pt-4">
+                    <div className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-2">Reputação</div>
+                    <div className="flex items-center gap-4">
+                      <div className="flex-1 bg-zinc-950 rounded-full h-4 border border-zinc-800 overflow-hidden">
+                        <div className="h-full bg-gradient-to-r from-amber-500 to-emerald-500" style={{ width: `${gameState.manager.reputation}%` }}></div>
+                      </div>
+                      <span className="font-bold font-mono">{gameState.manager.reputation}/100</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-zinc-950 border border-zinc-800 rounded-xl p-6">
+                  <h4 className="font-bold text-zinc-400 mb-4 uppercase text-xs tracking-wider">Estatísticas da Carreira</h4>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <div className="text-zinc-500 text-sm">Jogos</div>
+                      <div className="text-2xl font-bold font-mono">{gameState.manager.matchesManaged}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500 text-sm">Vitórias</div>
+                      <div className="text-2xl font-bold font-mono text-emerald-400">{gameState.manager.wins}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500 text-sm">Empates</div>
+                      <div className="text-2xl font-bold font-mono text-amber-400">{gameState.manager.draws}</div>
+                    </div>
+                    <div>
+                      <div className="text-zinc-500 text-sm">Derrotas</div>
+                      <div className="text-2xl font-bold font-mono text-red-400">{gameState.manager.losses}</div>
+                    </div>
+                    <div className="col-span-2 pt-2 border-t border-zinc-800/50">
+                      <div className="text-zinc-500 text-sm">Aproveitamento</div>
+                      <div className="text-xl font-bold font-mono">
+                        {gameState.manager.matchesManaged > 0 
+                          ? ((gameState.manager.wins * 3 + gameState.manager.draws) / (gameState.manager.matchesManaged * 3) * 100).toFixed(1) 
+                          : '0.0'}%
+                      </div>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           )}
