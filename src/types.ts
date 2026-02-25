@@ -5,8 +5,9 @@ export interface MatchEvent {
   minute: number;
   type: 'goal' | 'yellow' | 'red' | 'sub' | 'foul' | 'chance';
   teamId: string;
-  playerId: string;
-  subInId?: string;
+  playerId: string;   // marcador / autor do evento
+  assistId?: string;  // assistente (apenas em type === 'goal')
+  subInId?: string;   // jogador que entra (apenas em type === 'sub')
 }
 
 export interface Player {
@@ -22,8 +23,8 @@ export interface Player {
   matchesPlayed: number;
   goals: number;
   assists: number;
-  trainingProgress: number; // 0 to 100, when 100 strength increases
-  morale: number; // 0 to 100
+  trainingProgress: number;
+  morale: number;
   salary: number;
   value: number;
   listedForSale: boolean;
@@ -68,7 +69,7 @@ export interface Match {
 export interface Manager {
   name: string;
   nationality: string;
-  reputation: number; // 0 to 100
+  reputation: number;
   matchesManaged: number;
   wins: number;
   draws: number;
@@ -85,4 +86,3 @@ export interface GameState {
   userLineup: string[];
   manager: Manager;
 }
-

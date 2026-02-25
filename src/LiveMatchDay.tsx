@@ -1,7 +1,13 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useReducer, useEffect, useRef, useState } from 'react';
 import { GameState, Match, Player, MatchEvent } from './types';
-import { getEffectiveStrength, getBestLineup } from './engine';
-import { Play, Pause, FastForward, ArrowRightLeft, Check, AlertCircle, Activity } from 'lucide-react';
+import { getEffectiveStrength, getBestLineup, pickWeightedPlayer } from './engine';
+import { RNG } from './rng';
+import {
+  Play, Pause, FastForward, ArrowRightLeft,
+  Check, AlertCircle, Activity, ChevronDown,
+} from 'lucide-react';
+
+// ─── Tipos internos ───────────────────────────────────────────────────────────
 
 export interface LiveMatch {
   match: Match;
@@ -16,6 +22,177 @@ export interface LiveMatch {
   awaySubs: number;
 }
 
+interface MatchDayState {
+  minute: number;
+  isFinished: boolean;
+  liveMatches: LiveMatch[];
+  livePlayers: Record<string, Player>;
+}
+
+type MatchDayAction =
+  | { type: 'TICK'; tickSeed: number; minute: number; userTeamId: string }
+  | { type: 'USER_SUB'; subOutId: string; subInId: string; userTeamId: string; minute: number };
+
+// ─── Reducer ─────────────────────────────────────────────────────────────────
+
+function matchDayReducer(state: MatchDayState, action: MatchDayAction): MatchDayState {
+  switch (action.type) {
+
+    case 'TICK': {
+      if (state.isFinished) return state;
+      const { tickSeed, minute, userTeamId } = action;
+      const rng = new RNG(tickSeed);
+      const rand = () => rng.next();
+
+      const nextPlayers: Record<string, Player> = {};
+      for (const id in state.livePlayers) nextPlayers[id] = { ...state.livePlayers[id] };
+
+      const nextMatches = state.liveMatches.map(lm => {
+        let homeScore = lm.homeScore, awayScore = lm.awayScore;
+        const events = [...lm.events];
+        let homeLineup = [...lm.homeLineup], awayLineup = [...lm.awayLineup];
+        let homeBench = [...lm.homeBench], awayBench = [...lm.awayBench];
+        let homeSubs = lm.homeSubs, awaySubs = lm.awaySubs;
+
+        const homeOnPitch = homeLineup.map(id => nextPlayers[id]).filter((p): p is Player => !!p && !p.redCard);
+        const awayOnPitch = awayLineup.map(id => nextPlayers[id]).filter((p): p is Player => !!p && !p.redCard);
+
+        const homeStr = homeOnPitch.reduce((s, p) => s + getEffectiveStrength(p), 0) / (homeOnPitch.length || 1);
+        const awayStr = awayOnPitch.reduce((s, p) => s + getEffectiveStrength(p), 0) / (awayOnPitch.length || 1);
+
+        const hChance = 0.015 * (homeStr / 80);
+        const aChance = 0.012 * (awayStr / 80);
+
+        // Gol mandante
+        if (rng.chance(hChance)) {
+          homeScore++;
+          const sc = pickWeightedPlayer(homeOnPitch, true, rand);
+          const as = sc ? pickWeightedPlayer(homeOnPitch.filter(p => p.id !== sc.id), false, rand) : null;
+          if (sc) events.push({ id: `${minute}-gh-${sc.id}`, minute, type: 'goal', teamId: lm.match.homeTeamId, playerId: sc.id, assistId: as?.id });
+        } else if (rng.chance(hChance * 3)) {
+          const p = pickWeightedPlayer(homeOnPitch, true, rand);
+          if (p) events.push({ id: `${minute}-ch-${p.id}`, minute, type: 'chance', teamId: lm.match.homeTeamId, playerId: p.id });
+        }
+
+        // Gol visitante
+        if (rng.chance(aChance)) {
+          awayScore++;
+          const sc = pickWeightedPlayer(awayOnPitch, true, rand);
+          const as = sc ? pickWeightedPlayer(awayOnPitch.filter(p => p.id !== sc.id), false, rand) : null;
+          if (sc) events.push({ id: `${minute}-ga-${sc.id}`, minute, type: 'goal', teamId: lm.match.awayTeamId, playerId: sc.id, assistId: as?.id });
+        } else if (rng.chance(aChance * 3)) {
+          const p = pickWeightedPlayer(awayOnPitch, true, rand);
+          if (p) events.push({ id: `${minute}-ca-${p.id}`, minute, type: 'chance', teamId: lm.match.awayTeamId, playerId: p.id });
+        }
+
+        // Energia, faltas e cartões
+        for (const p of [...homeOnPitch, ...awayOnPitch]) {
+          const pid = p.id;
+          if (rng.chance(0.3)) nextPlayers[pid] = { ...nextPlayers[pid], energy: Math.max(0, nextPlayers[pid].energy - 1) };
+          if (rng.chance(0.01)) events.push({ id: `${minute}-fo-${pid}`, minute, type: 'foul', teamId: p.teamId, playerId: pid });
+          if (rng.chance(0.002)) {
+            if (rng.chance(0.1)) {
+              nextPlayers[pid] = { ...nextPlayers[pid], redCard: true };
+              events.push({ id: `${minute}-rd-${pid}`, minute, type: 'red', teamId: p.teamId, playerId: pid });
+            } else {
+              const y = nextPlayers[pid].yellowCards + 1;
+              if (y >= 2) {
+                nextPlayers[pid] = { ...nextPlayers[pid], yellowCards: 0, redCard: true };
+                events.push({ id: `${minute}-r2y-${pid}`, minute, type: 'red', teamId: p.teamId, playerId: pid });
+              } else {
+                nextPlayers[pid] = { ...nextPlayers[pid], yellowCards: y };
+                events.push({ id: `${minute}-yw-${pid}`, minute, type: 'yellow', teamId: p.teamId, playerId: pid });
+              }
+            }
+          }
+        }
+
+        // Sub IA — mandante
+        if (lm.match.homeTeamId !== userTeamId && homeSubs < 3 && minute > 60) {
+          const tired = homeOnPitch.find(p => nextPlayers[p.id].energy < 40);
+          if (tired && homeBench.length > 0) {
+            const [subIn, ...rest] = homeBench;
+            homeLineup = [...homeLineup.filter(id => id !== tired.id), subIn];
+            homeBench = rest; homeSubs++;
+            events.push({ id: `${minute}-sbh-${tired.id}`, minute, type: 'sub', teamId: lm.match.homeTeamId, playerId: tired.id, subInId: subIn });
+          }
+        }
+
+        // Sub IA — visitante
+        if (lm.match.awayTeamId !== userTeamId && awaySubs < 3 && minute > 60) {
+          const tired = awayOnPitch.find(p => nextPlayers[p.id].energy < 40);
+          if (tired && awayBench.length > 0) {
+            const [subIn, ...rest] = awayBench;
+            awayLineup = [...awayLineup.filter(id => id !== tired.id), subIn];
+            awayBench = rest; awaySubs++;
+            events.push({ id: `${minute}-sba-${tired.id}`, minute, type: 'sub', teamId: lm.match.awayTeamId, playerId: tired.id, subInId: subIn });
+          }
+        }
+
+        return { ...lm, homeScore, awayScore, events, homeLineup, awayLineup, homeBench, awayBench, homeSubs, awaySubs };
+      });
+
+      const nextMinute = minute + 1;
+      return { minute: nextMinute, isFinished: nextMinute >= 90, liveMatches: nextMatches, livePlayers: nextPlayers };
+    }
+
+    case 'USER_SUB': {
+      const { subOutId, subInId, userTeamId, minute } = action;
+      const nextMatches = state.liveMatches.map(lm => {
+        const isHome = lm.match.homeTeamId === userTeamId;
+        const isAway = lm.match.awayTeamId === userTeamId;
+        if (!isHome && !isAway) return lm;
+
+        let homeLineup = [...lm.homeLineup], awayLineup = [...lm.awayLineup];
+        let homeBench = [...lm.homeBench], awayBench = [...lm.awayBench];
+        let homeSubs = lm.homeSubs, awaySubs = lm.awaySubs;
+        const events = [...lm.events];
+
+        if (isHome && homeSubs < 5) {
+          homeLineup = [...homeLineup.filter(id => id !== subOutId), subInId];
+          homeBench = homeBench.filter(id => id !== subInId); homeSubs++;
+          events.push({ id: `${minute}-sbu-${subOutId}`, minute, type: 'sub', teamId: lm.match.homeTeamId, playerId: subOutId, subInId });
+        } else if (isAway && awaySubs < 5) {
+          awayLineup = [...awayLineup.filter(id => id !== subOutId), subInId];
+          awayBench = awayBench.filter(id => id !== subInId); awaySubs++;
+          events.push({ id: `${minute}-sbu-${subOutId}`, minute, type: 'sub', teamId: lm.match.awayTeamId, playerId: subOutId, subInId });
+        }
+
+        return { ...lm, homeLineup, awayLineup, homeBench, awayBench, homeSubs, awaySubs, events };
+      });
+      return { ...state, liveMatches: nextMatches };
+    }
+
+    default: return state;
+  }
+}
+
+// ─── Inicializador ────────────────────────────────────────────────────────────
+
+function buildInitialState(gameState: GameState, matches: Match[], userLineup: string[]): MatchDayState {
+  const livePlayers: Record<string, Player> = {};
+  gameState.players.forEach(p => { livePlayers[p.id] = { ...p }; });
+
+  const liveMatches: LiveMatch[] = matches.map(m => {
+    const hp = gameState.players.filter(p => p.teamId === m.homeTeamId);
+    const ap = gameState.players.filter(p => p.teamId === m.awayTeamId);
+    const homeLineupIds = m.homeTeamId === gameState.userTeamId ? [...userLineup] : getBestLineup(hp).map(p => p.id);
+    const awayLineupIds = m.awayTeamId === gameState.userTeamId ? [...userLineup] : getBestLineup(ap).map(p => p.id);
+    return {
+      match: m,
+      homeLineup: homeLineupIds,
+      awayLineup: awayLineupIds,
+      homeBench: hp.filter(p => !homeLineupIds.includes(p.id) && !p.redCard).map(p => p.id),
+      awayBench: ap.filter(p => !awayLineupIds.includes(p.id) && !p.redCard).map(p => p.id),
+      homeScore: 0, awayScore: 0, events: [], homeSubs: 0, awaySubs: 0,
+    };
+  });
+
+  return { minute: 0, isFinished: false, liveMatches, livePlayers };
+}
+
+// ─── Componente ───────────────────────────────────────────────────────────────
+
 interface Props {
   gameState: GameState;
   matches: Match[];
@@ -24,542 +201,325 @@ interface Props {
 }
 
 export default function LiveMatchDay({ gameState, matches, userLineup, onComplete }: Props) {
-  const [minute, setMinute] = useState(0);
+  const [state, dispatch] = useReducer(
+    matchDayReducer, undefined,
+    () => buildInitialState(gameState, matches, userLineup)
+  );
+
   const [isPlaying, setIsPlaying] = useState(true);
-  const [speed, setSpeed] = useState(300); // ms per minute
-  const [isFinished, setIsFinished] = useState(false);
-
-  const [liveMatches, setLiveMatches] = useState<LiveMatch[]>(() => {
-    return matches.map(m => {
-      let homePlayers = gameState.players.filter(p => p.teamId === m.homeTeamId);
-      let awayPlayers = gameState.players.filter(p => p.teamId === m.awayTeamId);
-
-      let homeLineupIds: string[] = [];
-      let awayLineupIds: string[] = [];
-
-      if (m.homeTeamId === gameState.userTeamId) {
-        homeLineupIds = [...userLineup];
-      } else {
-        homeLineupIds = getBestLineup(homePlayers).map(p => p.id);
-      }
-
-      if (m.awayTeamId === gameState.userTeamId) {
-        awayLineupIds = [...userLineup];
-      } else {
-        awayLineupIds = getBestLineup(awayPlayers).map(p => p.id);
-      }
-
-      const homeBenchIds = homePlayers.filter(p => !homeLineupIds.includes(p.id) && !p.redCard).map(p => p.id);
-      const awayBenchIds = awayPlayers.filter(p => !awayLineupIds.includes(p.id) && !p.redCard).map(p => p.id);
-
-      return {
-        match: m,
-        homeLineup: homeLineupIds,
-        awayLineup: awayLineupIds,
-        homeBench: homeBenchIds,
-        awayBench: awayBenchIds,
-        homeScore: 0,
-        awayScore: 0,
-        events: [],
-        homeSubs: 0,
-        awaySubs: 0
-      };
-    });
-  });
-
-  const [livePlayers, setLivePlayers] = useState<Record<string, Player>>(() => {
-    const map: Record<string, Player> = {};
-    gameState.players.forEach(p => {
-      map[p.id] = { ...p };
-    });
-    return map;
-  });
-
+  const [speed, setSpeed] = useState(300);
   const [selectedSubOut, setSelectedSubOut] = useState<string | null>(null);
+  const [showOtherScores, setShowOtherScores] = useState(false);
+
+  const masterRng = useRef(RNG.fromMatch(gameState.currentRound, matches[0]?.round ?? 0));
 
   useEffect(() => {
-    if (!isPlaying || isFinished) return;
-
+    if (!isPlaying || state.isFinished) return;
     const timer = setTimeout(() => {
-      if (minute >= 90) {
-        setIsFinished(true);
-        setIsPlaying(false);
-        return;
-      }
-
-      setMinute(m => m + 1);
-      
-      setLiveMatches(prevMatches => prevMatches.map(lm => {
-        let newHomeScore = lm.homeScore;
-        let newAwayScore = lm.awayScore;
-        const newEvents = [...lm.events];
-        let newHomeLineup = [...lm.homeLineup];
-        let newAwayLineup = [...lm.awayLineup];
-        let newHomeBench = [...lm.homeBench];
-        let newAwayBench = [...lm.awayBench];
-        let newHomeSubs = lm.homeSubs;
-        let newAwaySubs = lm.awaySubs;
-
-        const homePlayersOnPitch = newHomeLineup.map(id => livePlayers[id]).filter(p => !p.redCard);
-        const awayPlayersOnPitch = newAwayLineup.map(id => livePlayers[id]).filter(p => !p.redCard);
-
-        const homeStrength = homePlayersOnPitch.reduce((sum, p) => sum + getEffectiveStrength(p), 0) / (homePlayersOnPitch.length || 1);
-        const awayStrength = awayPlayersOnPitch.reduce((sum, p) => sum + getEffectiveStrength(p), 0) / (awayPlayersOnPitch.length || 1);
-
-        const homeChance = 0.015 * (homeStrength / 80);
-        const awayChance = 0.012 * (awayStrength / 80);
-
-        const pickPlayer = (players: Player[], isScorer: boolean) => {
-          const weights = players.map(p => {
-            let w = 1;
-            if (p.position === 'A') w = isScorer ? 10 : 5;
-            if (p.position === 'M') w = isScorer ? 4 : 8;
-            if (p.position === 'D') w = isScorer ? 1 : 2;
-            if (p.position === 'G') w = 0;
-            return w;
-          });
-          const totalWeight = weights.reduce((a, b) => a + b, 0);
-          if (totalWeight === 0) return players[0];
-          let roll = Math.random() * totalWeight;
-          for (let i = 0; i < players.length; i++) {
-            roll -= weights[i];
-            if (roll <= 0) return players[i];
-          }
-          return players[0];
-        };
-
-        if (Math.random() < homeChance) {
-          newHomeScore++;
-          const scorer = pickPlayer(homePlayersOnPitch, true);
-          if (scorer) newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'goal', teamId: lm.match.homeTeamId, playerId: scorer.id });
-        } else if (Math.random() < homeChance * 3) {
-          const player = pickPlayer(homePlayersOnPitch, true);
-          if (player) newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'chance', teamId: lm.match.homeTeamId, playerId: player.id });
-        }
-
-        if (Math.random() < awayChance) {
-          newAwayScore++;
-          const scorer = pickPlayer(awayPlayersOnPitch, true);
-          if (scorer) newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'goal', teamId: lm.match.awayTeamId, playerId: scorer.id });
-        } else if (Math.random() < awayChance * 3) {
-          const player = pickPlayer(awayPlayersOnPitch, true);
-          if (player) newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'chance', teamId: lm.match.awayTeamId, playerId: player.id });
-        }
-
-        // Cards, Energy, Fouls
-        setLivePlayers(prevPlayers => {
-          const nextPlayers = { ...prevPlayers };
-          [...homePlayersOnPitch, ...awayPlayersOnPitch].forEach(p => {
-            // Energy drops by ~0.2 to 0.4 per minute
-            if (Math.random() < 0.3) {
-              nextPlayers[p.id] = { ...nextPlayers[p.id], energy: Math.max(0, nextPlayers[p.id].energy - 1) };
-            }
-            // Fouls
-            if (Math.random() < 0.01) {
-              newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'foul', teamId: p.teamId, playerId: p.id });
-            }
-            // Cards
-            if (Math.random() < 0.002) {
-              if (Math.random() < 0.1) {
-                nextPlayers[p.id] = { ...nextPlayers[p.id], redCard: true };
-                newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'red', teamId: p.teamId, playerId: p.id });
-              } else {
-                const yellows = nextPlayers[p.id].yellowCards + 1;
-                if (yellows >= 2) {
-                  nextPlayers[p.id] = { ...nextPlayers[p.id], yellowCards: 0, redCard: true };
-                  newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'red', teamId: p.teamId, playerId: p.id });
-                } else {
-                  nextPlayers[p.id] = { ...nextPlayers[p.id], yellowCards: yellows };
-                  newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'yellow', teamId: p.teamId, playerId: p.id });
-                }
-              }
-            }
-          });
-          return nextPlayers;
-        });
-
-        // AI Substitutions (simple logic: if energy < 40 and subs < 3, sub out)
-        if (lm.match.homeTeamId !== gameState.userTeamId && newHomeSubs < 3 && minute > 60) {
-          const tired = homePlayersOnPitch.find(p => livePlayers[p.id].energy < 40);
-          if (tired && newHomeBench.length > 0) {
-            const subIn = newHomeBench[0];
-            newHomeLineup = newHomeLineup.filter(id => id !== tired.id);
-            newHomeLineup.push(subIn);
-            newHomeBench = newHomeBench.filter(id => id !== subIn);
-            newHomeSubs++;
-            newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'sub', teamId: lm.match.homeTeamId, playerId: tired.id, subInId: subIn });
-          }
-        }
-        if (lm.match.awayTeamId !== gameState.userTeamId && newAwaySubs < 3 && minute > 60) {
-          const tired = awayPlayersOnPitch.find(p => livePlayers[p.id].energy < 40);
-          if (tired && newAwayBench.length > 0) {
-            const subIn = newAwayBench[0];
-            newAwayLineup = newAwayLineup.filter(id => id !== tired.id);
-            newAwayLineup.push(subIn);
-            newAwayBench = newAwayBench.filter(id => id !== subIn);
-            newAwaySubs++;
-            newEvents.push({ id: Math.random().toString(), minute: minute + 1, type: 'sub', teamId: lm.match.awayTeamId, playerId: tired.id, subInId: subIn });
-          }
-        }
-
-        return {
-          ...lm,
-          homeScore: newHomeScore,
-          awayScore: newAwayScore,
-          events: newEvents,
-          homeLineup: newHomeLineup,
-          awayLineup: newAwayLineup,
-          homeBench: newHomeBench,
-          awayBench: newAwayBench,
-          homeSubs: newHomeSubs,
-          awaySubs: newAwaySubs
-        };
-      }));
-
+      dispatch({ type: 'TICK', tickSeed: masterRng.current.nextInt(0, 0xffff_ffff), minute: state.minute, userTeamId: gameState.userTeamId! });
     }, speed);
-
     return () => clearTimeout(timer);
-  }, [minute, isPlaying, isFinished, speed, livePlayers, gameState.userTeamId]);
-
-  const handleSub = (subInId: string) => {
-    if (!selectedSubOut) return;
-    
-    setLiveMatches(prev => prev.map(lm => {
-      const isHome = lm.match.homeTeamId === gameState.userTeamId;
-      const isAway = lm.match.awayTeamId === gameState.userTeamId;
-      if (!isHome && !isAway) return lm;
-
-      let newHomeLineup = [...lm.homeLineup];
-      let newAwayLineup = [...lm.awayLineup];
-      let newHomeBench = [...lm.homeBench];
-      let newAwayBench = [...lm.awayBench];
-      let newHomeSubs = lm.homeSubs;
-      let newAwaySubs = lm.awaySubs;
-      const newEvents = [...lm.events];
-
-      if (isHome && newHomeSubs < 5) {
-        newHomeLineup = newHomeLineup.filter(id => id !== selectedSubOut);
-        newHomeLineup.push(subInId);
-        newHomeBench = newHomeBench.filter(id => id !== subInId);
-        newHomeSubs++;
-        newEvents.push({ id: Math.random().toString(), minute, type: 'sub', teamId: lm.match.homeTeamId, playerId: selectedSubOut, subInId });
-      } else if (isAway && newAwaySubs < 5) {
-        newAwayLineup = newAwayLineup.filter(id => id !== selectedSubOut);
-        newAwayLineup.push(subInId);
-        newAwayBench = newAwayBench.filter(id => id !== subInId);
-        newAwaySubs++;
-        newEvents.push({ id: Math.random().toString(), minute, type: 'sub', teamId: lm.match.awayTeamId, playerId: selectedSubOut, subInId });
-      }
-
-      return {
-        ...lm,
-        homeLineup: newHomeLineup,
-        awayLineup: newAwayLineup,
-        homeBench: newHomeBench,
-        awayBench: newAwayBench,
-        homeSubs: newHomeSubs,
-        awaySubs: newAwaySubs,
-        events: newEvents
-      };
-    }));
-    setSelectedSubOut(null);
-  };
+  }, [state.minute, state.isFinished, isPlaying, speed, gameState.userTeamId]);
 
   const finishMatch = () => {
-    const updatedMatches = liveMatches.map(lm => ({
-      ...lm.match,
-      homeScore: lm.homeScore,
-      awayScore: lm.awayScore,
-      played: true
+    const updatedMatches = state.liveMatches.map(lm => ({ ...lm.match, homeScore: lm.homeScore, awayScore: lm.awayScore, played: true }));
+    const allEvents = state.liveMatches.flatMap(lm => lm.events);
+    const playerUpdates: Partial<Player>[] = Object.values(state.livePlayers).map(p => ({
+      id: p.id,
+      energy: p.energy,
+      yellowCards: p.yellowCards,
+      redCard: p.redCard,
+      goals: p.goals + allEvents.filter(e => e.type === 'goal' && e.playerId === p.id).length,
+      assists: p.assists + allEvents.filter(e => e.type === 'goal' && e.assistId === p.id).length,
+      matchesPlayed: p.matchesPlayed + 1,
     }));
-
-    const playerUpdates: Partial<Player>[] = [];
-    Object.values(livePlayers).forEach((p: Player) => {
-      let goals = 0;
-      liveMatches.forEach(lm => {
-        goals += lm.events.filter(e => e.type === 'goal' && e.playerId === p.id).length;
-      });
-
-      playerUpdates.push({
-        id: p.id,
-        energy: p.energy,
-        yellowCards: p.yellowCards,
-        redCard: p.redCard,
-        goals: p.goals + goals,
-        matchesPlayed: p.matchesPlayed + 1
-      });
-    });
-
     onComplete(updatedMatches, playerUpdates);
   };
 
-  const userMatch = liveMatches.find(m => m.match.homeTeamId === gameState.userTeamId || m.match.awayTeamId === gameState.userTeamId);
-  const otherMatches = liveMatches.filter(m => m.match.id !== userMatch?.match.id);
+  // Derivações
   const userTeam = gameState.teams.find(t => t.id === gameState.userTeamId)!;
-  
+  const userMatch = state.liveMatches.find(m => m.match.homeTeamId === userTeam.id || m.match.awayTeamId === userTeam.id);
   if (!userMatch) return null;
 
+  const otherMatches = state.liveMatches.filter(m => m.match.id !== userMatch.match.id);
   const isHome = userMatch.match.homeTeamId === userTeam.id;
-  const opponentId = isHome ? userMatch.match.awayTeamId : userMatch.match.homeTeamId;
-  const opponentTeam = gameState.teams.find(t => t.id === opponentId)!;
+  const oppTeam = gameState.teams.find(t => t.id === (isHome ? userMatch.match.awayTeamId : userMatch.match.homeTeamId))!;
+  const leftTeam = isHome ? userTeam : oppTeam;
+  const rightTeam = isHome ? oppTeam : userTeam;
 
   const userLineupIds = isHome ? userMatch.homeLineup : userMatch.awayLineup;
   const userBenchIds = isHome ? userMatch.homeBench : userMatch.awayBench;
   const userSubs = isHome ? userMatch.homeSubs : userMatch.awaySubs;
+  const lp = state.livePlayers;
 
+  const handleSubSelect = (id: string) => {
+    const p = lp[id];
+    if (!p || p.redCard || userSubs >= 5) return;
+    setSelectedSubOut(prev => prev === id ? null : id);
+  };
+
+  const handleSubIn = (subInId: string) => {
+    if (!selectedSubOut) return;
+    dispatch({ type: 'USER_SUB', subOutId: selectedSubOut, subInId, userTeamId: userTeam.id, minute: state.minute });
+    setSelectedSubOut(null);
+  };
+
+  const countEvt = (type: MatchEvent['type'], teamId: string) =>
+    userMatch.events.filter(e => e.type === type && e.teamId === teamId).length;
+
+  // Minuto formatado com barra de progresso
+  const pct = Math.min(100, (state.minute / 90) * 100);
+
+  // ─── Render ───────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans flex flex-col">
-      {/* Top Bar */}
-      <header className="bg-zinc-900 border-b border-zinc-800 p-4 sticky top-0 z-10 flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <div className="text-3xl font-black font-mono text-emerald-400 w-16 text-center">
-            {minute}'
-          </div>
-          <div className="flex gap-2">
-            <button 
-              onClick={() => setIsPlaying(!isPlaying)}
-              disabled={isFinished}
-              className="p-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors disabled:opacity-50"
-            >
-              {isPlaying ? <Pause size={20} /> : <Play size={20} />}
-            </button>
-            <button 
-              onClick={() => setSpeed(s => s === 300 ? 50 : 300)}
-              disabled={isFinished}
-              className={`p-2 rounded-lg transition-colors disabled:opacity-50 ${speed === 50 ? 'bg-emerald-500/20 text-emerald-400' : 'bg-zinc-800 hover:bg-zinc-700'}`}
-            >
-              <FastForward size={20} />
-            </button>
-          </div>
+
+      {/* Header compacto */}
+      <header className="bg-zinc-900 border-b border-zinc-800 sticky top-0 z-20">
+        {/* Barra de progresso da partida */}
+        <div className="h-0.5 bg-zinc-800">
+          <div className="h-full bg-emerald-500 transition-all duration-300" style={{ width: `${pct}%` }} />
         </div>
-        
-        {isFinished && (
-          <button 
-            onClick={finishMatch}
-            className="bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold py-2 px-6 rounded-full flex items-center gap-2 transition-colors animate-in fade-in"
-          >
-            <Check size={18} />
-            Continuar
-          </button>
-        )}
+        <div className="px-4 py-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="font-black font-mono text-emerald-400 text-2xl w-14">{state.minute}'</div>
+            <div className="flex gap-1.5">
+              <button onClick={() => setIsPlaying(p => !p)} disabled={state.isFinished}
+                className="p-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors disabled:opacity-40">
+                {isPlaying ? <Pause size={18} /> : <Play size={18} />}
+              </button>
+              <button onClick={() => setSpeed(s => s === 300 ? 50 : 300)} disabled={state.isFinished}
+                className={`p-2 rounded-lg transition-colors disabled:opacity-40 ${speed === 50 ? 'bg-emerald-500/20 text-emerald-400' : 'bg-zinc-800 hover:bg-zinc-700'}`}>
+                <FastForward size={18} />
+              </button>
+            </div>
+          </div>
+
+          {/* Placar no header para poupar espaço no mobile */}
+          <div className="flex items-center gap-2 sm:gap-4">
+            <span className="font-bold text-sm hidden sm:block truncate max-w-[100px]">{leftTeam.name}</span>
+            <div className="font-black font-mono text-xl sm:text-2xl bg-zinc-950 border border-zinc-800 px-3 py-1 rounded-xl">
+              {userMatch.homeScore} - {userMatch.awayScore}
+            </div>
+            <span className="font-bold text-sm hidden sm:block truncate max-w-[100px]">{rightTeam.name}</span>
+          </div>
+
+          {state.isFinished
+            ? <button onClick={finishMatch} className="bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold py-2 px-4 rounded-full flex items-center gap-1.5 text-sm transition-colors">
+                <Check size={16} /> Continuar
+              </button>
+            : <div className="w-24 hidden sm:block" /> /* placeholder para alinhar */
+          }
+        </div>
       </header>
 
-      <main className="flex-1 max-w-7xl mx-auto w-full p-4 grid grid-cols-1 lg:grid-cols-4 gap-6">
-        
-        {/* Main Match Area */}
-        <div className="lg:col-span-3 flex flex-col gap-6">
-          
-          {/* Scoreboard */}
-          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-8 flex flex-col items-center justify-between">
-            <div className="flex w-full items-center justify-between mb-8">
-              <div className="flex-1 flex flex-col items-center gap-4">
-                <div className="w-24 h-24 rounded-full flex items-center justify-center text-4xl font-bold shadow-lg" style={{ backgroundColor: isHome ? userTeam.color : opponentTeam.color, color: '#fff' }}>
-                  {(isHome ? userTeam.name : opponentTeam.name).charAt(0)}
+      <div className="flex-1 flex flex-col lg:flex-row max-w-7xl mx-auto w-full">
+
+        {/* ── Área principal ── */}
+        <div className="flex-1 min-w-0 flex flex-col gap-4 p-3 sm:p-5">
+
+          {/* Scoreboard expandido — só sm+ */}
+          <div className="hidden sm:block bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
+            <div className="flex items-center justify-between mb-5">
+              <div className="flex-1 flex flex-col items-center gap-2">
+                <div className="w-16 h-16 rounded-full flex items-center justify-center text-2xl font-black" style={{ backgroundColor: leftTeam.color, color: '#fff' }}>
+                  {leftTeam.name.charAt(0)}
                 </div>
-                <h2 className="text-xl font-bold text-center">{isHome ? userTeam.name : opponentTeam.name}</h2>
+                <span className="font-bold text-center text-sm">{leftTeam.name}</span>
               </div>
-              
-              <div className="px-8 text-6xl font-black font-mono tabular-nums tracking-tighter">
+              <div className="px-6 text-5xl font-black font-mono tabular-nums">
                 {userMatch.homeScore} - {userMatch.awayScore}
               </div>
-              
-              <div className="flex-1 flex flex-col items-center gap-4">
-                <div className="w-24 h-24 rounded-full flex items-center justify-center text-4xl font-bold shadow-lg" style={{ backgroundColor: !isHome ? userTeam.color : opponentTeam.color, color: '#fff' }}>
-                  {(!isHome ? userTeam.name : opponentTeam.name).charAt(0)}
+              <div className="flex-1 flex flex-col items-center gap-2">
+                <div className="w-16 h-16 rounded-full flex items-center justify-center text-2xl font-black" style={{ backgroundColor: rightTeam.color, color: '#fff' }}>
+                  {rightTeam.name.charAt(0)}
                 </div>
-                <h2 className="text-xl font-bold text-center">{!isHome ? userTeam.name : opponentTeam.name}</h2>
+                <span className="font-bold text-center text-sm">{rightTeam.name}</span>
               </div>
             </div>
-
-            {/* Match Stats */}
-            <div className="w-full max-w-md grid grid-cols-3 gap-y-4 text-sm">
-              <div className="text-center font-bold">{userMatch.events.filter(e => e.teamId === (isHome ? userTeam.id : opponentTeam.id) && e.type === 'chance').length}</div>
-              <div className="text-center text-zinc-500 uppercase text-xs tracking-wider">Chances</div>
-              <div className="text-center font-bold">{userMatch.events.filter(e => e.teamId === (!isHome ? userTeam.id : opponentTeam.id) && e.type === 'chance').length}</div>
-
-              <div className="text-center font-bold">{userMatch.events.filter(e => e.teamId === (isHome ? userTeam.id : opponentTeam.id) && e.type === 'foul').length}</div>
-              <div className="text-center text-zinc-500 uppercase text-xs tracking-wider">Faltas</div>
-              <div className="text-center font-bold">{userMatch.events.filter(e => e.teamId === (!isHome ? userTeam.id : opponentTeam.id) && e.type === 'foul').length}</div>
-
-              <div className="text-center font-bold text-amber-400">{userMatch.events.filter(e => e.teamId === (isHome ? userTeam.id : opponentTeam.id) && e.type === 'yellow').length}</div>
-              <div className="text-center text-zinc-500 uppercase text-xs tracking-wider">Amarelos</div>
-              <div className="text-center font-bold text-amber-400">{userMatch.events.filter(e => e.teamId === (!isHome ? userTeam.id : opponentTeam.id) && e.type === 'yellow').length}</div>
+            <div className="grid grid-cols-3 gap-2 text-xs text-center max-w-xs mx-auto">
+              {(['chance','foul','yellow'] as MatchEvent['type'][]).map(type => (
+                <React.Fragment key={type}>
+                  <div className={`font-bold ${type === 'yellow' ? 'text-amber-400' : ''}`}>{countEvt(type, leftTeam.id)}</div>
+                  <div className="text-zinc-500 uppercase tracking-wider">{type === 'chance' ? 'Chances' : type === 'foul' ? 'Faltas' : 'Amarelos'}</div>
+                  <div className={`font-bold ${type === 'yellow' ? 'text-amber-400' : ''}`}>{countEvt(type, rightTeam.id)}</div>
+                </React.Fragment>
+              ))}
             </div>
           </div>
 
-          {/* Events Log */}
-          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 flex-1 overflow-y-auto max-h-[300px]">
-            <h3 className="font-bold text-lg mb-4 text-zinc-400">Eventos da Partida</h3>
-            <div className="flex flex-col gap-3">
-              {userMatch.events.slice().reverse().map(event => {
-                const player = livePlayers[event.playerId];
-                const isUserEvent = event.teamId === userTeam.id;
-                return (
-                  <div key={event.id} className={`flex items-center gap-4 ${isUserEvent ? 'flex-row' : 'flex-row-reverse'}`}>
-                    <div className="font-mono text-zinc-500 w-8 text-center">{event.minute}'</div>
-                    <div className={`flex items-center gap-2 px-4 py-2 rounded-lg ${isUserEvent ? 'bg-zinc-800/50' : 'bg-zinc-800/20'}`}>
-                      {event.type === 'goal' && <span className="text-emerald-400 font-bold">⚽ GOL!</span>}
-                      {event.type === 'yellow' && <div className="w-3 h-4 bg-amber-400 rounded-sm"></div>}
-                      {event.type === 'red' && <div className="w-3 h-4 bg-red-500 rounded-sm"></div>}
-                      {event.type === 'sub' && <ArrowRightLeft size={16} className="text-blue-400" />}
-                      {event.type === 'foul' && <span className="text-zinc-500 text-xs uppercase font-bold">Falta</span>}
-                      {event.type === 'chance' && <span className="text-blue-400 text-xs uppercase font-bold">Perigo</span>}
-                      
-                      <span className="font-medium">{player?.name}</span>
-                      
-                      {event.type === 'sub' && event.subInId && (
-                        <>
-                          <span className="text-zinc-500">saiu para a entrada de</span>
-                          <span className="font-medium">{livePlayers[event.subInId]?.name}</span>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-              {userMatch.events.length === 0 && (
-                <div className="text-center text-zinc-600 py-8">Nenhum evento importante ainda.</div>
+          {/* Outros resultados — accordion no mobile */}
+          {otherMatches.length > 0 && (
+            <div className="sm:hidden bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
+              <button onClick={() => setShowOtherScores(s => !s)}
+                className="w-full flex items-center justify-between px-4 py-2.5 text-sm">
+                <span className="flex items-center gap-2 text-zinc-400"><Activity size={15} /> Outros placares</span>
+                <ChevronDown size={16} className={`text-zinc-500 transition-transform ${showOtherScores ? 'rotate-180' : ''}`} />
+              </button>
+              {showOtherScores && (
+                <div className="border-t border-zinc-800 divide-y divide-zinc-800/50">
+                  {otherMatches.map(lm => {
+                    const h = gameState.teams.find(t => t.id === lm.match.homeTeamId)!;
+                    const a = gameState.teams.find(t => t.id === lm.match.awayTeamId)!;
+                    return (
+                      <div key={lm.match.id} className="flex items-center px-4 py-2 text-xs gap-2">
+                        <span className="flex-1 text-right truncate">{h.name}</span>
+                        <span className="font-mono font-bold bg-zinc-950 px-2 py-0.5 rounded border border-zinc-800">{lm.homeScore}-{lm.awayScore}</span>
+                        <span className="flex-1 truncate">{a.name}</span>
+                      </div>
+                    );
+                  })}
+                </div>
               )}
             </div>
+          )}
+
+          {/* Eventos */}
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl sm:rounded-2xl overflow-hidden">
+            <div className="px-4 py-3 border-b border-zinc-800 text-xs text-zinc-500 font-medium uppercase tracking-wider">
+              Eventos da partida
+            </div>
+            <div className="overflow-y-auto max-h-48 sm:max-h-60 flex flex-col-reverse px-3 py-2 gap-1.5">
+              {userMatch.events.length === 0
+                ? <div className="text-center text-zinc-600 py-4 text-sm">Nenhum evento ainda.</div>
+                : [...userMatch.events].reverse().map(event => {
+                  const player = lp[event.playerId];
+                  const assister = event.assistId ? lp[event.assistId] : null;
+                  const subIn = event.subInId ? lp[event.subInId] : null;
+                  const isUser = event.teamId === userTeam.id;
+                  return (
+                    <div key={event.id} className={`flex items-center gap-2 text-xs ${isUser ? 'flex-row' : 'flex-row-reverse'}`}>
+                      <span className="font-mono text-zinc-600 w-6 text-center flex-shrink-0">{event.minute}'</span>
+                      <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg max-w-[85%] ${isUser ? 'bg-zinc-800/60' : 'bg-zinc-800/30'}`}>
+                        {event.type === 'goal'   && <span className="text-emerald-400 font-bold">⚽ GOL!</span>}
+                        {event.type === 'yellow' && <div className="w-2 h-3 bg-amber-400 rounded-sm flex-shrink-0" />}
+                        {event.type === 'red'    && <div className="w-2 h-3 bg-red-500 rounded-sm flex-shrink-0" />}
+                        {event.type === 'sub'    && <ArrowRightLeft size={12} className="text-blue-400 flex-shrink-0" />}
+                        {event.type === 'foul'   && <span className="text-zinc-500 font-bold uppercase text-[10px]">Falta</span>}
+                        {event.type === 'chance' && <span className="text-blue-400 font-bold uppercase text-[10px]">Perigo</span>}
+                        <span className="font-medium truncate">{player?.name}</span>
+                        {event.type === 'goal' && assister && <span className="text-zinc-500 truncate hidden sm:inline">(ass: {assister.name})</span>}
+                        {event.type === 'sub' && subIn && <><span className="text-zinc-600">↔</span><span className="font-medium truncate">{subIn.name}</span></>}
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
           </div>
 
-          {/* User Team Management */}
-          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden">
-            <div className="p-4 border-b border-zinc-800 flex justify-between items-center bg-zinc-950/50">
-              <h3 className="font-bold text-lg">Seu Time (Em Campo)</h3>
-              <div className="text-sm text-zinc-400">
-                Substituições: <span className="font-bold text-white">{userSubs}/5</span>
-              </div>
+          {/* Gestão do time */}
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl sm:rounded-2xl overflow-hidden">
+            <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
+              <span className="font-bold text-sm">Seu Time</span>
+              <span className="text-xs text-zinc-500">Subs: <span className="text-white font-bold">{userSubs}/5</span></span>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4">
-              <div>
-                <h4 className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-2">Titulares</h4>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:divide-x divide-zinc-800">
+              {/* Titulares */}
+              <div className="p-3">
+                <div className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-2">Titulares</div>
                 <div className="flex flex-col gap-1">
                   {userLineupIds.map(id => {
-                    const p = livePlayers[id];
+                    const p = lp[id];
                     if (!p) return null;
-                    const isSelected = selectedSubOut === id;
+                    const sel = selectedSubOut === id;
                     return (
-                      <div 
-                        key={id} 
-                        onClick={() => {
-                          if (userSubs < 5 && !p.redCard) {
-                            setSelectedSubOut(isSelected ? null : id);
-                          }
-                        }}
-                        className={`flex items-center justify-between p-2 rounded-lg cursor-pointer transition-colors ${isSelected ? 'bg-blue-500/20 border border-blue-500/50' : 'bg-zinc-800/50 hover:bg-zinc-800'} ${p.redCard ? 'opacity-50 cursor-not-allowed' : ''}`}
-                      >
-                        <div className="flex items-center gap-3">
-                          <span className="text-xs font-bold w-4">{p.position}</span>
-                          <span className="font-medium">{p.name}</span>
-                          {p.redCard && <div className="w-2 h-3 bg-red-500 rounded-sm"></div>}
-                          {!p.redCard && Array.from({ length: p.yellowCards }).map((_, i) => (
-                            <div key={i} className="w-2 h-3 bg-amber-400 rounded-sm"></div>
-                          ))}
-                        </div>
-                        <div className="flex items-center gap-3">
-                          <div className="flex items-center gap-1" title={`Moral: ${p.morale}%`}>
-                            <span className="text-xs text-zinc-400">{p.morale}%</span>
-                            <div className="w-8 h-1.5 bg-zinc-900 rounded-full overflow-hidden">
-                              <div className={`h-full ${p.morale > 60 ? 'bg-blue-500' : p.morale > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.morale}%` }}></div>
-                            </div>
+                      <div key={id} onClick={() => handleSubSelect(id)}
+                        className={`flex items-center gap-2 p-2 rounded-lg transition-colors
+                          ${p.redCard ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer active:scale-[0.98]'}
+                          ${sel ? 'bg-blue-500/15 border border-blue-500/40' : 'hover:bg-zinc-800/60'}`}>
+                        <span className="text-[10px] font-bold text-zinc-500 w-4 flex-shrink-0">{p.position}</span>
+                        <span className="font-medium text-xs flex-1 truncate">{p.name}</span>
+                        {p.redCard && <div className="w-2 h-3 bg-red-500 rounded-sm flex-shrink-0" />}
+                        {!p.redCard && p.yellowCards > 0 && <div className="w-2 h-3 bg-amber-400 rounded-sm flex-shrink-0" />}
+                        <div className="flex items-center gap-1.5 flex-shrink-0">
+                          <div className="w-10 h-1 bg-zinc-800 rounded-full overflow-hidden">
+                            <div className={`h-full ${p.energy > 60 ? 'bg-emerald-500' : p.energy > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.energy}%` }} />
                           </div>
-                          <div className="flex items-center gap-1" title={`Energia: ${p.energy}%`}>
-                            <span className="text-xs text-zinc-400">{p.energy}%</span>
-                            <div className="w-8 h-1.5 bg-zinc-900 rounded-full overflow-hidden">
-                              <div className={`h-full ${p.energy > 60 ? 'bg-emerald-500' : p.energy > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.energy}%` }}></div>
-                            </div>
-                          </div>
-                          <span className="font-mono text-xs bg-zinc-950 px-1.5 py-0.5 rounded text-zinc-400">{p.strength}</span>
+                          <span className="text-[10px] font-mono text-zinc-500 w-5">{p.strength}</span>
                         </div>
                       </div>
                     );
                   })}
                 </div>
               </div>
-              
-              <div>
-                <h4 className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-2">Banco de Reservas</h4>
-                <div className="flex flex-col gap-1">
-                  {userBenchIds.map(id => {
-                    const p = livePlayers[id];
-                    if (!p) return null;
-                    return (
-                      <div 
-                        key={id} 
-                        onClick={() => {
-                          if (selectedSubOut) {
-                            handleSub(id);
-                          }
-                        }}
-                        className={`flex items-center justify-between p-2 rounded-lg transition-colors ${selectedSubOut ? 'bg-zinc-800 hover:bg-zinc-700 cursor-pointer border border-zinc-700' : 'bg-zinc-900/50 opacity-50'}`}
-                      >
-                        <div className="flex items-center gap-3">
-                          <span className="text-xs font-bold w-4">{p.position}</span>
-                          <span className="font-medium">{p.name}</span>
-                        </div>
-                        <div className="flex items-center gap-3">
-                          <div className="flex items-center gap-1" title={`Moral: ${p.morale}%`}>
-                            <span className="text-xs text-zinc-400">{p.morale}%</span>
-                            <div className="w-8 h-1.5 bg-zinc-900 rounded-full overflow-hidden">
-                              <div className={`h-full ${p.morale > 60 ? 'bg-blue-500' : p.morale > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.morale}%` }}></div>
+
+              {/* Banco */}
+              <div className="p-3">
+                <div className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-2">Banco</div>
+                {userBenchIds.length === 0
+                  ? <p className="text-xs text-zinc-600 p-2">Sem reservas.</p>
+                  : <div className="flex flex-col gap-1">
+                    {userBenchIds.map(id => {
+                      const p = lp[id];
+                      if (!p) return null;
+                      return (
+                        <div key={id} onClick={() => selectedSubOut && handleSubIn(id)}
+                          className={`flex items-center gap-2 p-2 rounded-lg transition-colors
+                            ${selectedSubOut ? 'cursor-pointer hover:bg-zinc-800/80 border border-zinc-700 active:scale-[0.98]' : 'opacity-40'}`}>
+                          <span className="text-[10px] font-bold text-zinc-500 w-4 flex-shrink-0">{p.position}</span>
+                          <span className="font-medium text-xs flex-1 truncate">{p.name}</span>
+                          <div className="flex items-center gap-1.5 flex-shrink-0">
+                            <div className="w-10 h-1 bg-zinc-800 rounded-full overflow-hidden">
+                              <div className={`h-full ${p.energy > 60 ? 'bg-emerald-500' : p.energy > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.energy}%` }} />
                             </div>
+                            <span className="text-[10px] font-mono text-zinc-500 w-5">{p.strength}</span>
                           </div>
-                          <div className="flex items-center gap-1" title={`Energia: ${p.energy}%`}>
-                            <span className="text-xs text-zinc-400">{p.energy}%</span>
-                            <div className="w-8 h-1.5 bg-zinc-900 rounded-full overflow-hidden">
-                              <div className={`h-full ${p.energy > 60 ? 'bg-emerald-500' : p.energy > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.energy}%` }}></div>
-                            </div>
-                          </div>
-                          <span className="font-mono text-xs bg-zinc-950 px-1.5 py-0.5 rounded text-zinc-400">{p.strength}</span>
                         </div>
-                      </div>
-                    );
-                  })}
-                  {userBenchIds.length === 0 && (
-                    <div className="text-sm text-zinc-500 p-2">Sem reservas disponíveis.</div>
-                  )}
-                </div>
+                      );
+                    })}
+                  </div>
+                }
                 {selectedSubOut && (
-                  <div className="mt-4 p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg flex items-start gap-2 text-sm text-blue-400">
-                    <AlertCircle size={16} className="mt-0.5 shrink-0" />
-                    <p>Selecione um jogador do banco para entrar no lugar de {livePlayers[selectedSubOut]?.name}.</p>
+                  <div className="mt-2 p-2 bg-blue-500/10 border border-blue-500/20 rounded-lg flex items-start gap-1.5 text-xs text-blue-400">
+                    <AlertCircle size={13} className="mt-0.5 flex-shrink-0" />
+                    <p>Escolha um reserva para substituir <strong>{lp[selectedSubOut]?.name}</strong>.</p>
                   </div>
                 )}
               </div>
             </div>
           </div>
 
+          {/* Botão continuar — mobile, aparece ao fim */}
+          {state.isFinished && (
+            <button onClick={finishMatch}
+              className="sm:hidden w-full bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-colors">
+              <Check size={20} /> Continuar
+            </button>
+          )}
         </div>
 
-        {/* Sidebar: Other Matches */}
-        <div className="lg:col-span-1">
-          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden sticky top-24">
-            <div className="p-4 border-b border-zinc-800 bg-zinc-950/50">
-              <h3 className="font-bold flex items-center gap-2">
-                <Activity size={18} className="text-emerald-400" />
-                Placar ao Vivo
-              </h3>
-            </div>
-            <div className="divide-y divide-zinc-800/50">
-              {otherMatches.map(lm => {
-                const home = gameState.teams.find(t => t.id === lm.match.homeTeamId)!;
-                const away = gameState.teams.find(t => t.id === lm.match.awayTeamId)!;
-                return (
-                  <div key={lm.match.id} className="p-3 flex items-center justify-between text-sm">
-                    <div className="flex-1 text-right truncate font-medium">{home.name}</div>
-                    <div className="px-3 font-mono font-bold bg-zinc-950 rounded mx-2 py-0.5 border border-zinc-800">
-                      {lm.homeScore} - {lm.awayScore}
-                    </div>
-                    <div className="flex-1 truncate font-medium">{away.name}</div>
-                  </div>
-                );
-              })}
-            </div>
+        {/* ── Sidebar: outros resultados — só desktop ── */}
+        <aside className="hidden lg:flex flex-col w-56 flex-shrink-0 border-l border-zinc-800 p-4 gap-3">
+          <div className="flex items-center gap-2 text-sm font-bold text-zinc-400">
+            <Activity size={16} className="text-emerald-400" /> Ao Vivo
           </div>
-        </div>
-
-      </main>
+          <div className="flex flex-col gap-2">
+            {otherMatches.map(lm => {
+              const h = gameState.teams.find(t => t.id === lm.match.homeTeamId)!;
+              const a = gameState.teams.find(t => t.id === lm.match.awayTeamId)!;
+              return (
+                <div key={lm.match.id} className="bg-zinc-900 border border-zinc-800 rounded-xl p-2.5 text-xs">
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: h.color }} />
+                      <span className="truncate">{h.name}</span>
+                    </div>
+                    <span className="font-mono font-bold ml-1">{lm.homeScore}</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: a.color }} />
+                      <span className="truncate">{a.name}</span>
+                    </div>
+                    <span className="font-mono font-bold ml-1">{lm.awayScore}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </aside>
+      </div>
     </div>
   );
 }
