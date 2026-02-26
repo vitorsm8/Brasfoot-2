@@ -9,7 +9,7 @@ import {
   TRANSFER_WINDOW_ROUNDS, TOTAL_SEASON_ROUNDS,
   ACADEMY_INFO, CUP_ROUND_LABELS,
 } from './types';
-import { getBestLineup } from './engine';
+import { getBestLineup, getTrainingSpeedFactor } from './engine';
 import { gameReducer } from './gameReducer';
 import {
   Trophy, Users, Calendar, Play, Dumbbell,
@@ -39,7 +39,7 @@ function MiniBar({ value, color }: { value: number; color: string }) {
   );
 }
 
-function AttrBar({ label, value, isPrimary }: { label: string; value: number; isPrimary?: boolean }) {
+const AttrBar: React.FC<{ label: string; value: number; isPrimary?: boolean }> = ({ label, value, isPrimary }) => {
   const color = value >= 75 ? 'bg-emerald-500' : value >= 55 ? 'bg-amber-500' : 'bg-red-500';
   return (
     <div className="flex items-center gap-2">
@@ -50,13 +50,24 @@ function AttrBar({ label, value, isPrimary }: { label: string; value: number; is
       <span className={`font-mono text-[10px] w-6 text-right flex-shrink-0 ${isPrimary ? 'text-zinc-300 font-bold' : 'text-zinc-500'}`}>{value}</span>
     </div>
   );
-}
+};
 
 function FormBadge({ streak }: { streak: number }) {
-  if (streak === 0) return null;
+  if (Math.abs(streak) < 0.3) return null;
   const color = streak > 0 ? 'text-emerald-400' : 'text-red-400';
   const arrow = streak > 0 ? '↑' : '↓';
-  return <span className={`text-[10px] font-bold ${color}`}>{arrow}{Math.abs(streak)}</span>;
+  const display = Math.round(Math.abs(streak) * 10) / 10;
+  return (
+    <span className={`text-[10px] font-bold ${color}`}>
+      {arrow}{display}
+    </span>
+  );
+}
+function TrainingSpeedBadge({ age }: { age: number }) {
+  const factor = getTrainingSpeedFactor(age);
+  const color = factor >= 1.3 ? 'text-emerald-400' : factor >= 1.0 ? 'text-zinc-400' : factor >= 0.7 ? 'text-amber-400' : 'text-red-400';
+  const label = factor >= 1.3 ? 'Rápido' : factor >= 1.0 ? 'Normal' : factor >= 0.7 ? 'Lento' : 'Muito lento';
+  return <span className={`text-[9px] font-bold ${color}`}>⚡{label} ({(factor * 100).toFixed(0)}%)</span>;
 }
 
 function RepBadge({ rep }: { rep: number }) {
@@ -86,7 +97,7 @@ const NAV: { key: Tab; icon: React.ReactNode; label: string }[] = [
   { key: 'historico', icon: <History size={20} />,      label: 'Histórico' },
 ];
 
-const STORAGE_KEY = 'brasmanager_save_v7';
+const STORAGE_KEY = 'brasmanager_save_v9';
 
 // ─── App ───────────────────────────────────────────────────────────────────────
 
@@ -791,53 +802,83 @@ export default function App() {
 
           {/* ── TRAINING ── */}
           {activeTab === 'training' && (
-            <div>
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="font-bold text-lg flex items-center gap-2"><Dumbbell size={18} className="text-zinc-400" /> Treino</h2>
-                <span className="text-xs text-zinc-500">R$50k/sessão{gameState.manager.specialization === 'desenvolvedor' && <span className="text-emerald-400 font-bold ml-1">· 2× Dev</span>}</span>
+  <div>
+    <div className="flex items-center justify-between mb-4">
+      <h2 className="font-bold text-lg flex items-center gap-2"><Dumbbell size={18} className="text-zinc-400" /> Treino</h2>
+      <span className="text-xs text-zinc-500">
+        R$50k/sessão
+        {gameState.manager.specialization === 'desenvolvedor' && <span className="text-emerald-400 font-bold ml-1">· 2× Dev</span>}
+      </span>
+    </div>
+
+    {/* Legenda de velocidade por idade */}
+    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-3 mb-4">
+      <div className="text-[10px] text-zinc-500 font-bold uppercase tracking-wider mb-2">Velocidade de treino por idade</div>
+      <div className="flex flex-wrap gap-3 text-[10px]">
+        <span className="text-emerald-400">⚡16-21: Rápido</span>
+        <span className="text-zinc-400">⚡22-29: Normal</span>
+        <span className="text-amber-400">⚡30-32: Lento</span>
+        <span className="text-red-400">⚡33+: Muito lento</span>
+      </div>
+      <p className="text-[10px] text-zinc-600 mt-1.5">Jovens têm chance de breakthrough (+2 atributo, potencial ↑). Veteranos podem falhar no treino.</p>
+    </div>
+
+    <div className="grid grid-cols-1 gap-3">
+      {userPlayers.filter(p => p.injuryWeeksLeft === 0).map(p => {
+        const primaries = PRIMARY_ATTRS[p.position];
+        const weakestAttr = primaries.reduce((w, k) => p.attributes[k] < p.attributes[w] ? k : w, primaries[0]);
+        const atCap = p.attributes[weakestAttr] >= p.potential;
+        const potGap = p.potential - p.strength;
+        return (
+          <div key={p.id} className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+            <div className="flex items-center gap-3 mb-3">
+              <span className={`inline-flex items-center justify-center w-9 h-9 rounded-lg font-bold text-xs border flex-shrink-0 ${posColor[p.position]}`}>{p.position}</span>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="font-semibold">{p.name}</span>
+                  <span className="text-xs text-zinc-500">{p.age}a</span>
+                  <FormBadge streak={p.formStreak} />
+                  <TrainingSpeedBadge age={p.age} />
+                </div>
+                <div className="text-xs text-zinc-500">
+                  Overall <span className="text-zinc-200 font-bold font-mono">{p.strength}</span>
+                  {' · '}Pot <span className="text-amber-400 font-bold font-mono">{p.potential}</span>
+                  {potGap > 0 && <span className="text-emerald-500/70 ml-1">(+{potGap} margem)</span>}
+                  {potGap <= 0 && <span className="text-zinc-600 ml-1">(no máximo)</span>}
+                </div>
               </div>
-              <div className="grid grid-cols-1 gap-3">
-                {userPlayers.filter(p => p.injuryWeeksLeft === 0).map(p => {
-                  const primaries = PRIMARY_ATTRS[p.position];
-                  const weakestAttr = primaries.reduce((w, k) => p.attributes[k] < p.attributes[w] ? k : w, primaries[0]);
-                  const atCap = p.attributes[weakestAttr] >= p.potential;
-                  return (
-                    <div key={p.id} className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
-                      <div className="flex items-center gap-3 mb-3">
-                        <span className={`inline-flex items-center justify-center w-9 h-9 rounded-lg font-bold text-xs border flex-shrink-0 ${posColor[p.position]}`}>{p.position}</span>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-1.5"><span className="font-semibold">{p.name}</span><span className="text-xs text-zinc-500">{p.age}a</span><FormBadge streak={p.formStreak} /></div>
-                          <div className="text-xs text-zinc-500">Overall <span className="text-zinc-200 font-bold font-mono">{p.strength}</span> · Pot <span className="text-amber-400 font-bold font-mono">{p.potential}</span></div>
-                        </div>
-                        <div className="flex items-center gap-2 flex-shrink-0">
-                          <div className="text-right">
-                            <div className="text-[10px] text-zinc-600 mb-0.5">Progresso</div>
-                            <div className="flex items-center gap-1.5">
-                              <div className="w-20 h-2 bg-zinc-800 rounded-full overflow-hidden"><div className="h-full bg-emerald-500 transition-all" style={{ width: `${p.trainingProgress}%` }} /></div>
-                              <span className="text-xs font-mono text-zinc-400">{p.trainingProgress}%</span>
-                            </div>
-                          </div>
-                          <button onClick={() => dispatch({ type: 'TRAIN_PLAYER', payload: { playerId: p.id } })}
-                            disabled={team.money < 50_000 || p.strength >= 99 || atCap}
-                            className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 border border-zinc-700 text-xs font-bold py-1.5 px-3 rounded-lg">Treinar</button>
-                        </div>
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-0.5">
-                        {primaries.map(k => (
-                          <div key={k} className="flex items-center gap-2">
-                            <span className={`text-[10px] w-20 flex-shrink-0 ${k === weakestAttr ? 'text-amber-400 font-bold' : 'text-zinc-500'}`}>{ATTR_LABELS[k]}{k === weakestAttr && ' ▲'}</span>
-                            <div className="flex-1 h-1.5 bg-zinc-800 rounded-full overflow-hidden"><div className={`h-full rounded-full ${p.attributes[k] >= 75 ? 'bg-emerald-500' : p.attributes[k] >= 55 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.attributes[k]}%` }} /></div>
-                            <span className="font-mono text-xs text-zinc-400 w-6 text-right">{p.attributes[k]}</span>
-                          </div>
-                        ))}
-                      </div>
-                      {atCap && <div className="mt-2 text-[10px] text-amber-600">Potencial máximo atingido.</div>}
-                    </div>
-                  );
-                })}
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <div className="text-right">
+                  <div className="text-[10px] text-zinc-600 mb-0.5">Progresso</div>
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-20 h-2 bg-zinc-800 rounded-full overflow-hidden"><div className="h-full bg-emerald-500 transition-all" style={{ width: `${p.trainingProgress}%` }} /></div>
+                    <span className="text-xs font-mono text-zinc-400">{p.trainingProgress}%</span>
+                  </div>
+                </div>
+                <button onClick={() => dispatch({ type: 'TRAIN_PLAYER', payload: { playerId: p.id } })}
+                  disabled={team.money < 50_000 || p.strength >= 99 || atCap}
+                  className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 border border-zinc-700 text-xs font-bold py-1.5 px-3 rounded-lg">Treinar</button>
               </div>
             </div>
-          )}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-0.5">
+              {primaries.map(k => (
+                <div key={k} className="flex items-center gap-2">
+                  <span className={`text-[10px] w-20 flex-shrink-0 ${k === weakestAttr ? 'text-amber-400 font-bold' : 'text-zinc-500'}`}>{ATTR_LABELS[k]}{k === weakestAttr && ' ▲'}</span>
+                  <div className="flex-1 h-1.5 bg-zinc-800 rounded-full overflow-hidden"><div className={`h-full rounded-full ${p.attributes[k] >= 75 ? 'bg-emerald-500' : p.attributes[k] >= 55 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.attributes[k]}%` }} /></div>
+                  <span className="font-mono text-xs text-zinc-400 w-6 text-right">{p.attributes[k]}</span>
+                  {p.attributes[k] >= p.potential && <span className="text-[8px] text-zinc-600">MAX</span>}
+                </div>
+              ))}
+            </div>
+            {atCap && <div className="mt-2 text-[10px] text-amber-600">Potencial máximo atingido nos atributos primários.</div>}
+            {p.age <= 21 && potGap > 10 && <div className="mt-2 text-[10px] text-emerald-500/70">⭐ Jovem promissor — chance de breakthrough no treino.</div>}
+            {p.age >= 30 && <div className="mt-2 text-[10px] text-zinc-600">Treino mais lento por idade. Atributos físicos podem regredir entre temporadas.</div>}
+          </div>
+        );
+      })}
+    </div>
+  </div>
+)}
 
           {/* ── FINANCES ── */}
           {activeTab === 'finances' && (

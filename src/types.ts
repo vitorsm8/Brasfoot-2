@@ -140,6 +140,7 @@ export interface Player {
   formStreak:number; isYouth:boolean;
   /** Anos de contrato restantes */
   contractYears:number;
+  releaseClause?: number;
 }
 
 export interface Stadium { level:number; capacity:number; ticketPrice:number; maintenanceCost:number; }

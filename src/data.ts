@@ -12,6 +12,18 @@ const LAST_NAMES  = ['Silva','Santos','Oliveira','Souza','Rodrigues','Ferreira',
 function rnd(min:number,max:number){return Math.floor(Math.random()*(max-min+1))+min;}
 export function randomName(){return `${FIRST_NAMES[rnd(0,FIRST_NAMES.length-1)]} ${LAST_NAMES[rnd(0,LAST_NAMES.length-1)]}`;}
 
+/**
+ * Fisher-Yates shuffle — garante aleatoriedade uniforme nos fixtures
+ */
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 function generateAttributes(pos:Position,base:number,potential:number):PlayerAttributes{
   const cap=Math.min(potential,99);
   type T='primary'|'secondary'|'weak';
@@ -39,14 +51,17 @@ export function generatePlayer(teamId:string,pos:Position,league:number,override
   const strength=computeOverall(attributes,pos);
   let value=Math.max(10_000,(strength-40)*400_000);
   if(age<23)value*=1.5;else if(age>28)value*=0.7;
+  const contract = rnd(1,4);
+  const finalValue = Math.floor(value);
   return {
     id:`${teamId}-p${Date.now()}-${Math.random().toString(36).slice(2,7)}`,
     name:randomName(),position:pos,strength,attributes,potential,age,teamId,
     energy:100,yellowCards:0,redCard:false,injuryWeeksLeft:0,
     matchesPlayed:0,goals:0,assists:0,trainingProgress:0,morale:80,
     salary:Math.max(1_000,Math.floor((strength-40)*8_000)),
-    value:Math.floor(value),listedForSale:Math.random()<0.1,
-    formStreak:0,isYouth,contractYears:rnd(1,4),
+    value:finalValue,listedForSale:Math.random()<0.1,
+    formStreak:0,isYouth,contractYears:contract,
+    releaseClause: Math.floor(finalValue * (1 + contract * 0.5)),
   };
 }
 
@@ -55,13 +70,20 @@ function generatePlayersForTeam(teamId:string,league:number):Player[]{
   return positions.map((pos,i)=>({...generatePlayer(teamId,pos,league),id:`${teamId}-p${i}`}));
 }
 
+/**
+ * Gera fixtures com shuffle dos times por liga.
+ * Cada temporada terá uma ordem diferente de confrontos.
+ */
 export function generateFixtures(teams:Team[]):Match[]{
   const matches:Match[]=[];let matchId=Date.now();
   for(let league=1;league<=3;league++){
-    const ids=teams.filter(t=>t.league===league).map(t=>t.id);
+    // BUGFIX: shuffle dos times antes de gerar fixtures
+    const ids = shuffle(teams.filter(t=>t.league===league).map(t=>t.id));
     const n=ids.length;const arr=[...ids];
     for(let round=0;round<n-1;round++){
-      for(let i=0;i<n/2;i++)matches.push({id:`m${matchId++}`,homeTeamId:arr[i],awayTeamId:arr[n-1-i],homeScore:0,awayScore:0,played:false,round:round+1,league});
+      for(let i=0;i<n/2;i++){
+        matches.push({id:`m${matchId++}`,homeTeamId:arr[i],awayTeamId:arr[n-1-i],homeScore:0,awayScore:0,played:false,round:round+1,league});
+      }
       arr.splice(1,0,arr.pop()!);
     }
     const first=matches.filter(m=>m.league===league&&m.round<=n-1);
