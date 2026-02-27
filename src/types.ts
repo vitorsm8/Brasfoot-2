@@ -5,6 +5,8 @@ export interface PlayerAttributes {
   velocidade: number; stamina: number; forca: number;
   posicionamento: number; decisao: number; marcacao: number;
   disciplina: number; lideranca: number;
+  /** Novo: habilidade de cabeceio — afeta bola parada */
+  cabeceio: number;
 }
 
 export const ATTR_LABELS: Record<keyof PlayerAttributes, string> = {
@@ -12,10 +14,11 @@ export const ATTR_LABELS: Record<keyof PlayerAttributes, string> = {
   velocidade:'Velocidade',stamina:'Stamina',forca:'Força',
   posicionamento:'Posicionamento',decisao:'Decisão',marcacao:'Marcação',
   disciplina:'Disciplina',lideranca:'Liderança',
+  cabeceio:'Cabeceio',
 };
 
 export const ATTR_GROUPS: { label: string; keys: (keyof PlayerAttributes)[] }[] = [
-  { label:'Técnico',     keys:['passe','chute','drible','cruzamento'] },
+  { label:'Técnico',     keys:['passe','chute','drible','cruzamento','cabeceio'] },
   { label:'Físico',      keys:['velocidade','stamina','forca'] },
   { label:'Tático',      keys:['posicionamento','decisao','marcacao'] },
   { label:'Psicológico', keys:['disciplina','lideranca'] },
@@ -23,9 +26,9 @@ export const ATTR_GROUPS: { label: string; keys: (keyof PlayerAttributes)[] }[] 
 
 export const PRIMARY_ATTRS: Record<Position, (keyof PlayerAttributes)[]> = {
   G:['posicionamento','decisao','marcacao','forca','disciplina'],
-  D:['marcacao','forca','posicionamento','velocidade','decisao'],
+  D:['marcacao','forca','posicionamento','velocidade','cabeceio'],
   M:['passe','decisao','stamina','drible','posicionamento'],
-  A:['chute','drible','velocidade','posicionamento','decisao'],
+  A:['chute','drible','velocidade','posicionamento','cabeceio'],
 };
 
 // ─── Formações ────────────────────────────────────────────────────────────────
@@ -76,7 +79,6 @@ export type CupRound = 'r16'|'qf'|'sf'|'final'|'done';
 export const CUP_ROUND_LABELS: Record<CupRound, string> = {
   r16:'Oitavas',qf:'Quartas',sf:'Semi-final',final:'Final',done:'Encerrada',
 };
-/** Liga round após o qual a copa round desbloqueia */
 export const CUP_UNLOCK_AFTER: Partial<Record<CupRound,number>> = {
   r16:3,qf:7,sf:12,final:16,
 };
@@ -88,7 +90,7 @@ export interface CupMatch {
 export interface Cup {
   season:number; matches:CupMatch[];
   currentRound:CupRound; winnerId?:string;
-  userCupResult:string; // 'Campeão' | 'Vice' | 'Semi-final' | 'Quartas' | 'Oitavas' | 'Não participou'
+  userCupResult:string;
 }
 
 // ─── Relatório pós-jogo ───────────────────────────────────────────────────────
@@ -97,12 +99,15 @@ export interface MatchReport {
   homeScore:number; awayScore:number;
   homeShots:number; awayShots:number;
   homePossession:number;
-  goalEvents:{playerId:string;teamId:string;minute:number;assistId?:string}[];
+  goalEvents:{playerId:string;teamId:string;minute:number;assistId?:string;isSetPiece?:boolean;setPieceType?:SetPieceType}[];
   cards:{playerId:string;teamId:string;minute:number;type:'yellow'|'red'}[];
   injuries:{playerId:string;teamId:string;minute:number}[];
   topPerformers:{playerId:string;teamId:string;rating:number}[];
   isCup:boolean;
 }
+
+// ─── Bola Parada ──────────────────────────────────────────────────────────────
+export type SetPieceType = 'corner' | 'freekick' | 'penalty';
 
 // ─── Objetivos da diretoria ───────────────────────────────────────────────────
 export type ObjectiveType = 'league_position'|'cup_round'|'no_relegation'|'win_count';
@@ -125,8 +130,12 @@ export interface SeasonRecord {
 // ─── Entidades principais ─────────────────────────────────────────────────────
 export interface MatchEvent {
   id:string; minute:number;
-  type:'goal'|'yellow'|'red'|'sub'|'foul'|'chance'|'injury';
+  type:'goal'|'yellow'|'red'|'sub'|'foul'|'chance'|'injury'|'corner'|'freekick'|'penalty'|'penalty_miss'|'tactical_change';
   teamId:string; playerId:string; assistId?:string; subInId?:string;
+  /** Detalhes extras para bola parada */
+  setPieceType?:SetPieceType;
+  /** Nova formação (para tactical_change events) */
+  newFormation?:string;
 }
 
 export interface Player {
@@ -138,9 +147,10 @@ export interface Player {
   trainingProgress:number; morale:number;
   salary:number; value:number; listedForSale:boolean;
   formStreak:number; isYouth:boolean;
-  /** Anos de contrato restantes */
   contractYears:number;
   releaseClause?: number;
+  /** Minutos jogados na temporada — afeta progressão */
+  minutesPlayed?: number;
 }
 
 export interface Stadium { level:number; capacity:number; ticketPrice:number; maintenanceCost:number; }
@@ -155,7 +165,6 @@ export interface Team {
   id:string; name:string; color:string; money:number;
   stadium:Stadium; finances:FinanceRecord[]; sponsorshipIncome:number; league:number;
   fanSatisfaction:number; academyLevel:number;
-  /** Reputação do clube 0-100 */
   reputation:number;
 }
 

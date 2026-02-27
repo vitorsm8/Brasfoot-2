@@ -1,811 +1,685 @@
-import React, { useReducer, useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import {
-  GameState, Match, Player, MatchEvent, MatchReport,
-  FORMATION_MODIFIERS,
+  GameState, Player, Match, MatchEvent, MatchReport, Formation,
+  FORMATION_MODIFIERS, SetPieceType,
 } from './types';
 import {
-  getEffectiveStrength, getBestLineup, pickWeightedPlayer,
-  computeMidfieldControl, resolveAttack, computeMomentum,
-  getHomeAdvantage, AttackResult,
+  getEffectiveStrength, computeMidfieldControl, resolveAttack,
+  computeMomentum, getHomeAdvantage, computeGoalkeeperSave,
+  checkSetPiece, resolveCorner, resolveFreeKick, resolvePenalty,
   getAITacticalStyle, getAIFormation, getAIMatchModifiers,
-  getAISubstitutionTarget, findBestSubIn, AIStyle,
+  getAIMidMatchFormationChange, getAISubstitutionTarget, findBestSubIn,
+  computeLeadershipBoost, pickWeightedPlayer, AttackOutcome,
 } from './engine';
-import { RNG } from './rng';
-import {
-  Play, Pause, FastForward, ArrowRightLeft, Check,
-  AlertCircle, Activity, ChevronDown, Bandage, Trophy,
-} from 'lucide-react';
+import { Play, Pause, FastForward, SkipForward, Trophy, Swords, Shield, Zap } from 'lucide-react';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Seeded RNG ───────────────────────────────────────────────────────────────
 
-export interface LiveMatch {
-  match: Match;
-  homeLineup: string[];
-  awayLineup: string[];
-  homeBench: string[];
-  awayBench: string[];
-  homeScore: number;
-  awayScore: number;
+class SeededRNG {
+  private state: number;
+  constructor(seed: number) { this.state = seed % 2147483647; if (this.state <= 0) this.state += 2147483646; }
+  next(): number { this.state = (this.state * 16807) % 2147483647; return (this.state - 1) / 2147483646; }
+  nextInt(min: number, max: number): number { return min + Math.floor(this.next() * (max - min + 1)); }
+}
+
+// ─── Tipos internos ───────────────────────────────────────────────────────────
+
+interface MatchState {
+  homeScore: number; awayScore: number;
+  homeLineup: Player[]; awayLineup: Player[];
+  homeBench: Player[]; awayBench: Player[];
+  homeFormation: Formation; awayFormation: Formation;
+  awayStyle: ReturnType<typeof getAITacticalStyle>;
   events: MatchEvent[];
-  homeSubs: number;
-  awaySubs: number;
-  // Formações e estilo tático
-  homeFormation: string;
-  awayFormation: string;
-  homeStyle: AIStyle | 'user';
-  awayStyle: AIStyle | 'user';
-  // Momentum tracking
-  lastHomeGoalMinute: number | null;
-  lastAwayGoalMinute: number | null;
-  lastHomeConcededMinute: number | null;
-  lastAwayConcededMinute: number | null;
-  // Stats
-  homeShots: number;
-  awayShots: number;
-  homeSaves: number;
-  awaySaves: number;
-}
-
-interface MatchDayState {
+  homePoss: number; awayPoss: number;
+  homeShots: number; awayShots: number;
   minute: number;
-  isFinished: boolean;
-  liveMatches: LiveMatch[];
-  livePlayers: Record<string, Player>;
-  injuredIds: string[];
+  homeRecentGoal: number | null; awayRecentGoal: number | null;
+  homeRecentConceded: number | null; awayRecentConceded: number | null;
+  homeSubs: number; awaySubs: number;
+  homeInjured: string[]; awayInjured: string[];
+  finished: boolean;
 }
-
-type MatchDayAction =
-  | { type: 'TICK'; tickSeed: number; minute: number; userTeamId: string; gameState: GameState }
-  | { type: 'USER_SUB'; subOutId: string; subInId: string; userTeamId: string; minute: number };
-
-// ─── Reducer ──────────────────────────────────────────────────────────────────
-
-function matchDayReducer(state: MatchDayState, action: MatchDayAction): MatchDayState {
-  if (action.type === 'USER_SUB') {
-    const { subOutId, subInId, userTeamId, minute } = action;
-    return {
-      ...state,
-      liveMatches: state.liveMatches.map(lm => {
-        const isHome = lm.match.homeTeamId === userTeamId;
-        const isAway = lm.match.awayTeamId === userTeamId;
-        if (!isHome && !isAway) return lm;
-
-        let hl = [...lm.homeLineup], al = [...lm.awayLineup];
-        let hb = [...lm.homeBench], ab = [...lm.awayBench];
-        let hs = lm.homeSubs, as2 = lm.awaySubs;
-        const evts = [...lm.events];
-
-        if (isHome && hs < 5) {
-          hl = [...hl.filter(id => id !== subOutId), subInId];
-          hb = hb.filter(id => id !== subInId);
-          hs++;
-          evts.push({ id: `${minute}-sbu-${subOutId}`, minute, type: 'sub', teamId: lm.match.homeTeamId, playerId: subOutId, subInId });
-        } else if (isAway && as2 < 5) {
-          al = [...al.filter(id => id !== subOutId), subInId];
-          ab = ab.filter(id => id !== subInId);
-          as2++;
-          evts.push({ id: `${minute}-sbu-${subOutId}`, minute, type: 'sub', teamId: lm.match.awayTeamId, playerId: subOutId, subInId });
-        }
-
-        return { ...lm, homeLineup: hl, awayLineup: al, homeBench: hb, awayBench: ab, homeSubs: hs, awaySubs: as2, events: evts };
-      }),
-    };
-  }
-
-  if (action.type === 'TICK') {
-    if (state.isFinished) return state;
-    const { tickSeed, minute, userTeamId, gameState } = action;
-    const rng = new RNG(tickSeed);
-    const rand = () => rng.next();
-    const spec = gameState.manager.specialization;
-    const ufm = FORMATION_MODIFIERS[gameState.formation];
-    const np: Record<string, Player> = {};
-    for (const id in state.livePlayers) np[id] = { ...state.livePlayers[id] };
-    const newInj = [...state.injuredIds];
-
-    const nextMatches = state.liveMatches.map(lm => {
-      let homeScore = lm.homeScore;
-      let awayScore = lm.awayScore;
-      let events = [...lm.events];
-      let homeLineup = [...lm.homeLineup];
-      let awayLineup = [...lm.awayLineup];
-      let homeBench = [...lm.homeBench];
-      let awayBench = [...lm.awayBench];
-      let homeSubs = lm.homeSubs;
-      let awaySubs = lm.awaySubs;
-      let homeShots = lm.homeShots;
-      let awayShots = lm.awayShots;
-      let homeSaves = lm.homeSaves;
-      let awaySaves = lm.awaySaves;
-      let lastHomeGoalMinute = lm.lastHomeGoalMinute;
-      let lastAwayGoalMinute = lm.lastAwayGoalMinute;
-      let lastHomeConcededMinute = lm.lastHomeConcededMinute;
-      let lastAwayConcededMinute = lm.lastAwayConcededMinute;
-
-      const isDown = (id: string) => np[id]?.redCard || newInj.includes(id);
-      const hOn = homeLineup.map(id => np[id]).filter((p): p is Player => !!p && !isDown(p.id));
-      const aOn = awayLineup.map(id => np[id]).filter((p): p is Player => !!p && !isDown(p.id));
-
-      const isUserHome = lm.match.homeTeamId === userTeamId;
-      const isUserAway = lm.match.awayTeamId === userTeamId;
-
-      // Modificadores: user usa formação/especialização, IA usa estilo tático dinâmico
-      let hAtkMod = 1, hDefMod = 1, aAtkMod = 1, aDefMod = 1;
-
-      if (isUserHome) {
-        hAtkMod = ufm.attack * (spec === 'ofensivo' ? 1.15 : 1);
-        hDefMod = ufm.defense * (spec === 'defensivo' ? 1.15 : 1);
-      } else if (lm.homeStyle !== 'user') {
-        const aiMods = getAIMatchModifiers(lm.homeStyle, lm.homeFormation as any, homeScore, awayScore, minute);
-        hAtkMod = aiMods.atkMod;
-        hDefMod = aiMods.defMod;
-      }
-
-      if (isUserAway) {
-        aAtkMod = ufm.attack * (spec === 'ofensivo' ? 1.15 : 1);
-        aDefMod = ufm.defense * (spec === 'defensivo' ? 1.15 : 1);
-      } else if (lm.awayStyle !== 'user') {
-        const aiMods = getAIMatchModifiers(lm.awayStyle, lm.awayFormation as any, awayScore, homeScore, minute);
-        aAtkMod = aiMods.atkMod;
-        aDefMod = aiMods.defMod;
-      }
-
-      // ── Computar controle de meio-campo (uma vez por tick) ──
-      const homeMidfieldControl = computeMidfieldControl(hOn, aOn);
-      const awayMidfieldControl = 1 - homeMidfieldControl;
-
-      // ── Computar momentum ──
-      const homeMomentum = computeMomentum(
-        homeScore, awayScore, minute,
-        lastHomeGoalMinute, lastHomeConcededMinute,
-      );
-      const awayMomentum = computeMomentum(
-        awayScore, homeScore, minute,
-        lastAwayGoalMinute, lastAwayConcededMinute,
-      );
-
-      // ── Home advantage ──
-      const homeAdv = getHomeAdvantage(true);
-      const awayAdv = getHomeAdvantage(false);
-
-      // ── Goleiros ──
-      const homeGK = hOn.find(p => p.position === 'G') ?? null;
-      const awayGK = aOn.find(p => p.position === 'G') ?? null;
-
-      // ── Ataque do mandante (fases encadeadas) ──
-      const homeAttack = resolveAttack({
-        attackers: hOn,
-        defenders: aOn,
-        goalkeeper: awayGK,
-        midfieldControl: homeMidfieldControl,
-        momentumBonus: homeMomentum,
-        homeAdvantage: homeAdv,
-        formationAtkMod: hAtkMod,
-        formationDefMod: aDefMod,
-        specAtkMod: isUserHome && spec === 'ofensivo' ? 1.15 : 1,
-        specDefMod: isUserAway && spec === 'defensivo' ? 1.15 : 1,
-        rand,
-      });
-
-      if (homeAttack.result === 'goal') {
-        homeScore++;
-        homeShots++;
-        lastHomeGoalMinute = minute;
-        lastAwayConcededMinute = minute;
-        if (homeAttack.shooter) {
-          events.push({
-            id: `${minute}-gh-${homeAttack.shooter.id}`,
-            minute, type: 'goal',
-            teamId: lm.match.homeTeamId,
-            playerId: homeAttack.shooter.id,
-            assistId: homeAttack.assister?.id,
-          });
-        }
-        // Moral boost/drop
-        homeLineup.forEach(id => { if (np[id]) np[id] = { ...np[id], morale: Math.min(100, np[id].morale + 5) }; });
-        awayLineup.forEach(id => { if (np[id]) np[id] = { ...np[id], morale: Math.max(0, np[id].morale - 4) }; });
-      } else if (homeAttack.result === 'saved') {
-        homeShots++;
-        awaySaves++;
-        if (homeAttack.shooter) {
-          events.push({
-            id: `${minute}-sv-h-${homeAttack.shooter.id}`,
-            minute, type: 'chance',
-            teamId: lm.match.homeTeamId,
-            playerId: homeAttack.shooter.id,
-          });
-        }
-      } else if (homeAttack.result === 'chance_missed') {
-        homeShots++;
-        if (homeAttack.shooter) {
-          events.push({
-            id: `${minute}-ch-${homeAttack.shooter.id}`,
-            minute, type: 'chance',
-            teamId: lm.match.homeTeamId,
-            playerId: homeAttack.shooter.id,
-          });
-        }
-      }
-
-      // ── Ataque do visitante ──
-      const awayAttack = resolveAttack({
-        attackers: aOn,
-        defenders: hOn,
-        goalkeeper: homeGK,
-        midfieldControl: awayMidfieldControl,
-        momentumBonus: awayMomentum,
-        homeAdvantage: awayAdv,
-        formationAtkMod: aAtkMod,
-        formationDefMod: hDefMod,
-        specAtkMod: isUserAway && spec === 'ofensivo' ? 1.15 : 1,
-        specDefMod: isUserHome && spec === 'defensivo' ? 1.15 : 1,
-        rand,
-      });
-
-      if (awayAttack.result === 'goal') {
-        awayScore++;
-        awayShots++;
-        lastAwayGoalMinute = minute;
-        lastHomeConcededMinute = minute;
-        if (awayAttack.shooter) {
-          events.push({
-            id: `${minute}-ga-${awayAttack.shooter.id}`,
-            minute, type: 'goal',
-            teamId: lm.match.awayTeamId,
-            playerId: awayAttack.shooter.id,
-            assistId: awayAttack.assister?.id,
-          });
-        }
-        awayLineup.forEach(id => { if (np[id]) np[id] = { ...np[id], morale: Math.min(100, np[id].morale + 5) }; });
-        homeLineup.forEach(id => { if (np[id]) np[id] = { ...np[id], morale: Math.max(0, np[id].morale - 4) }; });
-      } else if (awayAttack.result === 'saved') {
-        awayShots++;
-        homeSaves++;
-        if (awayAttack.shooter) {
-          events.push({
-            id: `${minute}-sv-a-${awayAttack.shooter.id}`,
-            minute, type: 'chance',
-            teamId: lm.match.awayTeamId,
-            playerId: awayAttack.shooter.id,
-          });
-        }
-      } else if (awayAttack.result === 'chance_missed') {
-        awayShots++;
-        if (awayAttack.shooter) {
-          events.push({
-            id: `${minute}-ca-${awayAttack.shooter.id}`,
-            minute, type: 'chance',
-            teamId: lm.match.awayTeamId,
-            playerId: awayAttack.shooter.id,
-          });
-        }
-      }
-
-      // ── Eventos físicos (cartões, lesões, energia) ──
-      for (const p of [...hOn, ...aOn]) {
-        const pid = p.id;
-
-        // Desgaste de energia (proporcional à stamina)
-        const staminaDrain = p.attributes.stamina > 70 ? 0.2 : p.attributes.stamina > 50 ? 0.3 : 0.4;
-        if (rng.chance(staminaDrain)) {
-          np[pid] = { ...np[pid], energy: Math.max(0, np[pid].energy - 1) };
-        }
-
-        // Cartões (disciplina afeta probabilidade)
-        const cardChance = 0.002 * (1.3 - (p.attributes.disciplina / 200));
-        if (rng.chance(cardChance)) {
-          if (rng.chance(0.1)) {
-            // Vermelho direto
-            np[pid] = { ...np[pid], redCard: true };
-            events.push({ id: `${minute}-rd-${pid}`, minute, type: 'red', teamId: p.teamId, playerId: pid });
-          } else {
-            const y = np[pid].yellowCards + 1;
-            if (y >= 2) {
-              np[pid] = { ...np[pid], yellowCards: 0, redCard: true };
-              events.push({ id: `${minute}-r2y-${pid}`, minute, type: 'red', teamId: p.teamId, playerId: pid });
-            } else {
-              np[pid] = { ...np[pid], yellowCards: y };
-              events.push({ id: `${minute}-yw-${pid}`, minute, type: 'yellow', teamId: p.teamId, playerId: pid });
-            }
-          }
-        }
-
-        // Lesões (energia baixa = mais risco)
-        const injP = np[pid].energy < 25 ? 0.0009 : np[pid].energy < 50 ? 0.0005 : 0.0003;
-        if (rng.chance(injP) && !newInj.includes(pid)) {
-          newInj.push(pid);
-          events.push({ id: `${minute}-inj-${pid}`, minute, type: 'injury', teamId: p.teamId, playerId: pid });
-        }
-      }
-
-      // ── Substituições da IA (sistema inteligente por estilo) ──
-      const processAISubs = (
-        l: string[], b: string[], s: number, tid: string, isUser: boolean,
-        style: AIStyle | 'user', teamScore: number, oppScore: number,
-      ) => {
-        if (isUser) return { lineup: l, bench: b, subs: s, events };
-        let ll = l, bb = b, ss = s, ee = events;
-        const maxSubs = 5;
-
-        // Pode fazer até 2 subs por tick (para cobrir lesão + tática)
-        for (let attempt = 0; attempt < 2 && ss < maxSubs && bb.length > 0; attempt++) {
-          const lineupPlayers = ll.map(id => np[id]).filter((p): p is Player => !!p);
-          const benchPlayers = bb.map(id => np[id]).filter((p): p is Player => !!p);
-
-          const target = getAISubstitutionTarget(
-            style === 'user' ? 'equilibrado' : style,
-            lineupPlayers, benchPlayers,
-            teamScore, oppScore, minute, newInj,
-          );
-          if (!target) break;
-
-          const outPlayer = np[target.outId];
-          if (!outPlayer) break;
-
-          const subIn = findBestSubIn(benchPlayers, target.preferPosition, outPlayer.position);
-          if (!subIn) break;
-
-          ll = [...ll.filter(id => id !== target.outId), subIn.id];
-          bb = bb.filter(id => id !== subIn.id);
-          ss++;
-          ee = [...ee, {
-            id: `${minute}-ai-${target.reason}-${target.outId}`,
-            minute, type: 'sub' as const,
-            teamId: tid, playerId: target.outId, subInId: subIn.id,
-          }];
-        }
-
-        return { lineup: ll, bench: bb, subs: ss, events: ee };
-      };
-
-      const hr = processAISubs(homeLineup, homeBench, homeSubs, lm.match.homeTeamId, lm.match.homeTeamId === userTeamId, lm.homeStyle, homeScore, awayScore);
-      homeLineup = hr.lineup; homeBench = hr.bench; homeSubs = hr.subs; events = hr.events;
-      const ar = processAISubs(awayLineup, awayBench, awaySubs, lm.match.awayTeamId, lm.match.awayTeamId === userTeamId, lm.awayStyle, awayScore, homeScore);
-      awayLineup = ar.lineup; awayBench = ar.bench; awaySubs = ar.subs; events = ar.events;
-
-      return {
-        ...lm,
-        homeScore, awayScore, events,
-        homeLineup, awayLineup, homeBench, awayBench,
-        homeSubs, awaySubs,
-        homeShots, awayShots, homeSaves, awaySaves,
-        lastHomeGoalMinute, lastAwayGoalMinute,
-        lastHomeConcededMinute, lastAwayConcededMinute,
-      };
-    });
-
-    const nextMin = minute + 1;
-    return { minute: nextMin, isFinished: nextMin >= 90, liveMatches: nextMatches, livePlayers: np, injuredIds: newInj };
-  }
-
-  return state;
-}
-
-// ─── Initial State ────────────────────────────────────────────────────────────
-
-function buildInitialState(gameState: GameState, matches: Match[], userLineup: string[]): MatchDayState {
-  const lp: Record<string, Player> = {};
-  gameState.players.forEach(p => { lp[p.id] = { ...p }; });
-
-  // GK staff boost
-  const gkB = gameState.staff.goleiros ?? 0;
-  if (gkB > 0) {
-    gameState.players
-      .filter(p => p.teamId === gameState.userTeamId && p.position === 'G')
-      .forEach(p => {
-        lp[p.id] = { ...lp[p.id], strength: Math.min(99, lp[p.id].strength + gkB * 2) };
-      });
-  }
-
-  const liveMatches: LiveMatch[] = matches.map(m => {
-    const hp = gameState.players.filter(p => p.teamId === m.homeTeamId);
-    const ap = gameState.players.filter(p => p.teamId === m.awayTeamId);
-
-    const homeTeam = gameState.teams.find(t => t.id === m.homeTeamId)!;
-    const awayTeam = gameState.teams.find(t => t.id === m.awayTeamId)!;
-
-    // IA: determina estilo tático e formação
-    const isUserHome = m.homeTeamId === gameState.userTeamId;
-    const isUserAway = m.awayTeamId === gameState.userTeamId;
-
-    const homeStyle: AIStyle | 'user' = isUserHome ? 'user' : getAITacticalStyle(homeTeam, gameState.players);
-    const awayStyle: AIStyle | 'user' = isUserAway ? 'user' : getAITacticalStyle(awayTeam, gameState.players);
-
-    const homeFormation = isUserHome ? gameState.formation : getAIFormation(homeStyle as AIStyle);
-    const awayFormation = isUserAway ? gameState.formation : getAIFormation(awayStyle as AIStyle);
-
-    const hl = isUserHome ? [...userLineup] : getBestLineup(hp, homeFormation).map(p => p.id);
-    const al = isUserAway ? [...userLineup] : getBestLineup(ap, awayFormation).map(p => p.id);
-
-    return {
-      match: m,
-      homeLineup: hl,
-      awayLineup: al,
-      homeBench: hp.filter(p => !hl.includes(p.id) && !p.redCard && p.injuryWeeksLeft === 0).map(p => p.id),
-      awayBench: ap.filter(p => !al.includes(p.id) && !p.redCard && p.injuryWeeksLeft === 0).map(p => p.id),
-      homeScore: 0, awayScore: 0,
-      events: [],
-      homeSubs: 0, awaySubs: 0,
-      homeFormation, awayFormation,
-      homeStyle, awayStyle,
-      lastHomeGoalMinute: null, lastAwayGoalMinute: null,
-      lastHomeConcededMinute: null, lastAwayConcededMinute: null,
-      homeShots: 0, awayShots: 0,
-      homeSaves: 0, awaySaves: 0,
-    };
-  });
-  return { minute: 0, isFinished: false, liveMatches, livePlayers: lp, injuredIds: [] };
-}
-
-// ─── Component ────────────────────────────────────────────────────────────────
 
 interface Props {
   gameState: GameState;
   matches: Match[];
   userLineup: string[];
-  onComplete: (matches: Match[], playerUpdates: Partial<Player>[], report: MatchReport) => void;
+  onComplete: (updatedMatches: Match[], playerUpdates: Partial<Player>[], report: MatchReport) => void;
   isCupMatch?: boolean;
 }
 
-export default function LiveMatchDay({ gameState, matches, userLineup, onComplete, isCupMatch = false }: Props) {
-  const [state, dispatch] = useReducer(matchDayReducer, undefined, () => buildInitialState(gameState, matches, userLineup));
-  const [isPlaying, setIsPlaying] = useState(true);
-  const [speed, setSpeed] = useState(300);
-  const [selectedSubOut, setSelectedSubOut] = useState<string | null>(null);
-  const [showOther, setShowOther] = useState(false);
-  const masterRng = useRef(new RNG(gameState.currentRound * 1000003 ^ (Date.now() & 0xffffffff)));
-  const prevInj = useRef(0);
+const TICK_SPEEDS = [800, 400, 150, 0]; // Normal, Rápido, Ultra, Instant
+const SPEED_LABELS = ['▶', '▶▶', '▶▶▶', '⏭'];
 
-  // Pause on user team injury
-  useEffect(() => {
-    const n = state.injuredIds.filter(id => state.livePlayers[id]?.teamId === gameState.userTeamId).length;
-    if (n > prevInj.current) { setIsPlaying(false); prevInj.current = n; }
-  }, [state.injuredIds.length]);
+export default function LiveMatchDay({ gameState, matches, userLineup, onComplete, isCupMatch }: Props) {
+  const { teams, players } = gameState;
+  const userTeamId = gameState.userTeamId!;
+  const userMatch = matches.find(m => m.homeTeamId === userTeamId || m.awayTeamId === userTeamId)!;
+  const isHome = userMatch.homeTeamId === userTeamId;
 
-  // Tick loop
-  useEffect(() => {
-    if (!isPlaying || state.isFinished) return;
-    const t = setTimeout(
-      () => dispatch({
-        type: 'TICK',
-        tickSeed: masterRng.current.nextInt(0, 0xffffffff),
-        minute: state.minute,
-        userTeamId: gameState.userTeamId!,
-        gameState,
-      }),
-      speed,
-    );
-    return () => clearTimeout(t);
-  }, [state.minute, state.isFinished, isPlaying, speed]);
+  const homeTeam = teams.find(t => t.id === userMatch.homeTeamId)!;
+  const awayTeam = teams.find(t => t.id === userMatch.awayTeamId)!;
 
-  // Finish match
-  const finishMatch = () => {
-    const um = state.liveMatches.map(lm => ({
-      ...lm.match, homeScore: lm.homeScore, awayScore: lm.awayScore, played: true,
-    }));
-    const allEv = state.liveMatches.flatMap(lm => lm.events);
+  const rng = useRef(new SeededRNG(Date.now()));
 
-    const playerUpdates: Partial<Player>[] = Object.values(state.livePlayers).map(p => ({
-      id: p.id,
-      energy: p.energy,
-      yellowCards: p.yellowCards,
-      redCard: p.redCard,
-      morale: p.morale,
-      injuryWeeksLeft: state.injuredIds.includes(p.id)
-        ? (Math.random() < 0.7 ? Math.floor(Math.random() * 2) + 1 : Math.floor(Math.random() * 3) + 3)
-        : p.injuryWeeksLeft,
-      goals: p.goals + allEv.filter(e => e.type === 'goal' && e.playerId === p.id).length,
-      assists: p.assists + allEv.filter(e => e.type === 'goal' && e.assistId === p.id).length,
-      matchesPlayed: p.matchesPlayed + 1,
-    }));
+  // ── Inicializar estado da partida ──────────────────────────────────────────
 
-    // Match report
-    const uid = gameState.userTeamId!;
-    const ulm = state.liveMatches.find(lm => lm.match.homeTeamId === uid || lm.match.awayTeamId === uid)!;
-    const hStr = ulm.homeLineup.reduce((s, id) => s + (state.livePlayers[id]?.strength ?? 0), 0) / Math.max(1, ulm.homeLineup.length);
-    const aStr = ulm.awayLineup.reduce((s, id) => s + (state.livePlayers[id]?.strength ?? 0), 0) / Math.max(1, ulm.awayLineup.length);
-    const homePoss = Math.round((hStr / Math.max(1, hStr + aStr)) * 100);
+  const initMatchState = useCallback((): MatchState => {
+    const allHomePlayers = players.filter(p => p.teamId === homeTeam.id && !p.redCard && p.injuryWeeksLeft === 0);
+    const allAwayPlayers = players.filter(p => p.teamId === awayTeam.id && !p.redCard && p.injuryWeeksLeft === 0);
 
-    const ratings: Record<string, number> = {};
-    [...ulm.homeLineup, ...ulm.awayLineup].forEach(id => { ratings[id] = 6 + Math.random() * 1.5; });
-    ulm.events.forEach(e => {
-      if (e.type === 'goal') {
-        ratings[e.playerId] = Math.min(10, (ratings[e.playerId] ?? 7) + 1.5);
-        if (e.assistId) ratings[e.assistId] = Math.min(10, (ratings[e.assistId] ?? 7) + 0.8);
+    let homeLineup: Player[], homeBench: Player[];
+    if (isHome) {
+      homeLineup = userLineup.map(id => players.find(p => p.id === id)!).filter(Boolean);
+      homeBench = allHomePlayers.filter(p => !userLineup.includes(p.id)).slice(0, 5);
+    } else {
+      homeLineup = allHomePlayers.sort((a, b) => b.strength - a.strength).slice(0, 11);
+      homeBench = allHomePlayers.filter(p => !homeLineup.includes(p)).slice(0, 5);
+    }
+
+    let awayLineup: Player[], awayBench: Player[];
+    if (!isHome) {
+      awayLineup = userLineup.map(id => players.find(p => p.id === id)!).filter(Boolean);
+      awayBench = allAwayPlayers.filter(p => !userLineup.includes(p.id)).slice(0, 5);
+    } else {
+      awayLineup = allAwayPlayers.sort((a, b) => b.strength - a.strength).slice(0, 11);
+      awayBench = allAwayPlayers.filter(p => !awayLineup.includes(p)).slice(0, 5);
+    }
+
+    const awayStyle = getAITacticalStyle(isHome ? awayTeam : homeTeam, players);
+    const aiFormation = getAIFormation(awayStyle);
+
+    return {
+      homeScore: 0, awayScore: 0,
+      homeLineup, awayLineup, homeBench, awayBench,
+      homeFormation: isHome ? gameState.formation : aiFormation,
+      awayFormation: isHome ? aiFormation : gameState.formation,
+      awayStyle,
+      events: [], homePoss: 0, awayPoss: 0, homeShots: 0, awayShots: 0,
+      minute: 0,
+      homeRecentGoal: null, awayRecentGoal: null,
+      homeRecentConceded: null, awayRecentConceded: null,
+      homeSubs: 0, awaySubs: 0,
+      homeInjured: [], awayInjured: [],
+      finished: false,
+    };
+  }, []);
+
+  const [matchState, setMatchState] = useState<MatchState>(initMatchState);
+  const [speedIdx, setSpeedIdx] = useState(0);
+  const [paused, setPaused] = useState(false);
+  const matchStateRef = useRef(matchState);
+  matchStateRef.current = matchState;
+
+  // ── Spec modifiers ─────────────────────────────────────────────────────────
+
+  const userSpec = gameState.manager.specialization;
+  const userSpecAtk = userSpec === 'ofensivo' ? 1.15 : 1.0;
+  const userSpecDef = userSpec === 'defensivo' ? 1.15 : 1.0;
+  const moraleMult = userSpec === 'motivador' ? 2.0 : 1.0;
+
+  // ── GK boost (staff) ──────────────────────────────────────────────────────
+
+  const gkBoost = gameState.staff.goleiros ?? 0;
+
+  // ── Tick do jogo ───────────────────────────────────────────────────────────
+
+  const simulateTick = useCallback(() => {
+    setMatchState(prev => {
+      if (prev.finished || prev.minute >= 90) return { ...prev, finished: true };
+
+      const s = { ...prev };
+      const minute = s.minute + 1;
+      s.minute = minute;
+      const rand = () => rng.current.next();
+      const newEvents: MatchEvent[] = [];
+
+      // ── AI mid-match formation change ──────────────────────────────────
+      const aiIsHome = !isHome;
+      const aiTeamScore = aiIsHome ? s.homeScore : s.awayScore;
+      const aiOppScore = aiIsHome ? s.awayScore : s.homeScore;
+
+      const newAIFormation = getAIMidMatchFormationChange(
+        s.awayStyle,
+        aiIsHome ? s.homeFormation : s.awayFormation,
+        aiTeamScore, aiOppScore, minute, rand,
+      );
+      if (newAIFormation) {
+        if (aiIsHome) s.homeFormation = newAIFormation;
+        else s.awayFormation = newAIFormation;
+        newEvents.push({
+          id: `tc_${minute}`, minute, type: 'tactical_change',
+          teamId: aiIsHome ? homeTeam.id : awayTeam.id,
+          playerId: '', newFormation: newAIFormation,
+        });
       }
-      if (e.type === 'red') ratings[e.playerId] = Math.max(3, (ratings[e.playerId] ?? 6) - 2);
-      if (e.type === 'injury') ratings[e.playerId] = Math.max(4, (ratings[e.playerId] ?? 6) - 1);
-    });
 
-    const topPerformers = Object.entries(ratings)
-      .map(([pid, r]) => ({ playerId: pid, teamId: state.livePlayers[pid]?.teamId ?? '', rating: Math.round(r * 10) / 10 }))
-      .sort((a, b) => b.rating - a.rating)
-      .slice(0, 8);
+      // ── AI substitutions (max 3) ──────────────────────────────────────
+      const aiLineup = aiIsHome ? s.homeLineup : s.awayLineup;
+      const aiBench = aiIsHome ? s.homeBench : s.awayBench;
+      const aiSubs = aiIsHome ? s.homeSubs : s.awaySubs;
+      const aiInjured = aiIsHome ? s.homeInjured : s.awayInjured;
+
+      if (aiSubs < 3 && minute > 45) {
+        const subTarget = getAISubstitutionTarget(
+          s.awayStyle, aiLineup, aiBench,
+          aiTeamScore, aiOppScore, minute, aiInjured,
+        );
+        if (subTarget) {
+          const subIn = findBestSubIn(aiBench, subTarget.preferPosition, aiLineup.find(p => p.id === subTarget.outId)?.position ?? 'M');
+          if (subIn) {
+            const outIdx = aiLineup.findIndex(p => p.id === subTarget.outId);
+            if (outIdx >= 0) {
+              newEvents.push({
+                id: `sub_${minute}_ai`, minute, type: 'sub',
+                teamId: aiIsHome ? homeTeam.id : awayTeam.id,
+                playerId: subTarget.outId, subInId: subIn.id,
+              });
+              const newLineup = [...aiLineup];
+              newLineup[outIdx] = subIn;
+              const newBench = aiBench.filter(p => p.id !== subIn.id);
+              if (aiIsHome) { s.homeLineup = newLineup; s.homeBench = newBench; s.homeSubs++; }
+              else { s.awayLineup = newLineup; s.awayBench = newBench; s.awaySubs++; }
+            }
+          }
+        }
+      }
+
+      // ── Resolve attacks with set pieces ────────────────────────────────
+
+      const resolveTeamAttack = (
+        attackers: Player[], defenders: Player[],
+        atkFormation: Formation, defFormation: Formation,
+        isAtkHome: boolean, atkTeamId: string,
+        atkScore: number, defScore: number,
+      ) => {
+        const homeAdv = getHomeAdvantage(isAtkHome);
+        const atkFm = FORMATION_MODIFIERS[atkFormation];
+        const defFm = FORMATION_MODIFIERS[defFormation];
+
+        // User spec modifiers
+        const isUserAtk = atkTeamId === userTeamId;
+        const specAtk = isUserAtk ? userSpecAtk : 1.0;
+        const specDef = isUserAtk ? 1.0 : userSpecDef;
+
+        // Midfield
+        const midControl = computeMidfieldControl(attackers, defenders);
+        if (rand() < midControl) s.homePoss += isAtkHome ? 1 : 0;
+        else s.awayPoss += isAtkHome ? 0 : 1;
+
+        // Momentum + leadership
+        const momentum = computeMomentum(
+          atkScore, defScore, minute,
+          isAtkHome ? s.homeRecentGoal : s.awayRecentGoal,
+          isAtkHome ? s.homeRecentConceded : s.awayRecentConceded,
+        );
+        const deficit = defScore - atkScore;
+        const leaderBoost = computeLeadershipBoost(attackers, deficit, minute);
+
+        const gk = defenders.find(p => p.position === 'G') ?? null;
+        // Apply GK staff boost if user's team
+        let boostedGk = gk;
+        if (gk && !isUserAtk && gkBoost > 0) {
+          // Don't boost opponent's GK
+        } else if (gk && isUserAtk && gkBoost > 0) {
+          boostedGk = { ...gk, attributes: { ...gk.attributes, posicionamento: Math.min(99, gk.attributes.posicionamento + gkBoost * 2) } };
+        }
+
+        // Main attack resolution
+        const outcome: AttackOutcome = resolveAttack({
+          attackers, defenders, goalkeeper: isUserAtk ? boostedGk : gk,
+          midfieldControl: midControl,
+          momentumBonus: momentum + leaderBoost,
+          homeAdvantage: homeAdv,
+          formationAtkMod: atkFm.attack, formationDefMod: defFm.defense,
+          specAtkMod: specAtk, specDefMod: specDef,
+          rand,
+        });
+
+        if (outcome.chanceCreated) {
+          if (isAtkHome) s.homeShots++; else s.awayShots++;
+        }
+
+        if (outcome.result === 'goal' && outcome.shooter) {
+          if (isAtkHome) {
+            s.homeScore++;
+            s.homeRecentGoal = minute;
+            s.awayRecentConceded = minute;
+          } else {
+            s.awayScore++;
+            s.awayRecentGoal = minute;
+            s.homeRecentConceded = minute;
+          }
+          newEvents.push({
+            id: `goal_${minute}_${atkTeamId}`, minute, type: 'goal',
+            teamId: atkTeamId, playerId: outcome.shooter.id,
+            assistId: outcome.assister?.id,
+          });
+        }
+
+        // ── SET PIECES ───────────────────────────────────────────────────
+        const setPiece = checkSetPiece(attackers, defenders, outcome.chanceCreated, outcome.shotBlocked, rand);
+
+        if (setPiece.type === 'corner') {
+          newEvents.push({ id: `corner_${minute}_${atkTeamId}`, minute, type: 'corner', teamId: atkTeamId, playerId: '', setPieceType: 'corner' });
+          const cornerResult = resolveCorner(attackers, defenders, isUserAtk ? boostedGk : gk, rand);
+          if (isAtkHome) s.homeShots++; else s.awayShots++;
+          if (cornerResult.result === 'goal' && cornerResult.scorer) {
+            if (isAtkHome) { s.homeScore++; s.homeRecentGoal = minute; s.awayRecentConceded = minute; }
+            else { s.awayScore++; s.awayRecentGoal = minute; s.homeRecentConceded = minute; }
+            newEvents.push({
+              id: `spg_${minute}_${atkTeamId}`, minute, type: 'goal',
+              teamId: atkTeamId, playerId: cornerResult.scorer.id,
+              assistId: cornerResult.assister?.id, setPieceType: 'corner',
+            });
+          }
+        }
+
+        if (setPiece.type === 'freekick') {
+          newEvents.push({ id: `fk_${minute}_${atkTeamId}`, minute, type: 'freekick', teamId: atkTeamId, playerId: setPiece.fouledPlayerId ?? '', setPieceType: 'freekick' });
+
+          // Card check on fouler
+          if (setPiece.foulingPlayerId) {
+            const fouler = defenders.find(p => p.id === setPiece.foulingPlayerId);
+            if (fouler) {
+              const defTeamId = isAtkHome ? awayTeam.id : homeTeam.id;
+              const cardChance = (100 - fouler.attributes.disciplina) / 800;
+              if (rand() < cardChance) {
+                const isRed = fouler.yellowCards >= 1 || rand() < 0.05;
+                newEvents.push({
+                  id: `card_${minute}_${fouler.id}`, minute,
+                  type: isRed ? 'red' : 'yellow',
+                  teamId: defTeamId, playerId: fouler.id,
+                });
+              }
+            }
+          }
+
+          const fkResult = resolveFreeKick(attackers, isUserAtk ? boostedGk : gk, rand);
+          if (isAtkHome) s.homeShots++; else s.awayShots++;
+          if (fkResult.result === 'goal' && fkResult.scorer) {
+            if (isAtkHome) { s.homeScore++; s.homeRecentGoal = minute; s.awayRecentConceded = minute; }
+            else { s.awayScore++; s.awayRecentGoal = minute; s.homeRecentConceded = minute; }
+            newEvents.push({
+              id: `spg_fk_${minute}_${atkTeamId}`, minute, type: 'goal',
+              teamId: atkTeamId, playerId: fkResult.scorer.id, setPieceType: 'freekick',
+            });
+          }
+        }
+
+        if (setPiece.type === 'penalty') {
+          newEvents.push({ id: `pen_${minute}_${atkTeamId}`, minute, type: 'penalty', teamId: atkTeamId, playerId: setPiece.fouledPlayerId ?? '', setPieceType: 'penalty' });
+
+          // Red/yellow card on fouler (penalty foul = harsher)
+          if (setPiece.foulingPlayerId) {
+            const fouler = defenders.find(p => p.id === setPiece.foulingPlayerId);
+            if (fouler) {
+              const defTeamId = isAtkHome ? awayTeam.id : homeTeam.id;
+              const isRed = rand() < 0.30; // 30% chance of red on penalty foul
+              newEvents.push({
+                id: `card_pen_${minute}_${fouler.id}`, minute,
+                type: isRed ? 'red' : 'yellow',
+                teamId: defTeamId, playerId: fouler.id,
+              });
+            }
+          }
+
+          const penResult = resolvePenalty(attackers, isUserAtk ? boostedGk : gk, rand);
+          if (isAtkHome) s.homeShots++; else s.awayShots++;
+          if (penResult.result === 'goal' && penResult.scorer) {
+            if (isAtkHome) { s.homeScore++; s.homeRecentGoal = minute; s.awayRecentConceded = minute; }
+            else { s.awayScore++; s.awayRecentGoal = minute; s.homeRecentConceded = minute; }
+            newEvents.push({
+              id: `spg_pen_${minute}_${atkTeamId}`, minute, type: 'goal',
+              teamId: atkTeamId, playerId: penResult.scorer.id, setPieceType: 'penalty',
+            });
+          } else if (penResult.result !== 'goal') {
+            newEvents.push({
+              id: `pm_${minute}_${atkTeamId}`, minute, type: 'penalty_miss',
+              teamId: atkTeamId, playerId: penResult.scorer?.id ?? '',
+            });
+          }
+        }
+
+        // ── Cards from regular play ──────────────────────────────────────
+        if (setPiece.type === null) {
+          for (const def of defenders.filter(p => p.position !== 'G')) {
+            const cardChance = (100 - def.attributes.disciplina) / 3000;
+            if (rand() < cardChance) {
+              const defTeamId = isAtkHome ? awayTeam.id : homeTeam.id;
+              const isRed = def.yellowCards >= 1 || rand() < 0.03;
+              newEvents.push({
+                id: `card_${minute}_${def.id}`, minute,
+                type: isRed ? 'red' : 'yellow',
+                teamId: defTeamId, playerId: def.id,
+              });
+            }
+          }
+        }
+
+        // ── Injuries ─────────────────────────────────────────────────────
+        const allPlayers = [...attackers, ...defenders];
+        for (const p of allPlayers) {
+          const injuryChance = 0.0008 * (1 - p.attributes.stamina / 200) * (minute > 70 ? 1.5 : 1.0);
+          if (rand() < injuryChance) {
+            const tId = attackers.includes(p) ? atkTeamId : (isAtkHome ? awayTeam.id : homeTeam.id);
+            newEvents.push({
+              id: `inj_${minute}_${p.id}`, minute, type: 'injury',
+              teamId: tId, playerId: p.id,
+            });
+            if (isAtkHome && attackers.includes(p)) s.homeInjured.push(p.id);
+            else if (isAtkHome && defenders.includes(p)) s.awayInjured.push(p.id);
+            else if (!isAtkHome && attackers.includes(p)) s.awayInjured.push(p.id);
+            else s.homeInjured.push(p.id);
+          }
+        }
+      };
+
+      // Home attacks
+      resolveTeamAttack(
+        s.homeLineup, s.awayLineup,
+        s.homeFormation, s.awayFormation,
+        true, homeTeam.id,
+        s.homeScore, s.awayScore,
+      );
+
+      // Away attacks
+      resolveTeamAttack(
+        s.awayLineup, s.homeLineup,
+        s.awayFormation, s.homeFormation,
+        false, awayTeam.id,
+        s.awayScore, s.homeScore,
+      );
+
+      // Energy drain
+      const drainEnergy = (lineup: Player[]) =>
+        lineup.map(p => ({
+          ...p,
+          energy: Math.max(0, p.energy - (0.8 + (100 - p.attributes.stamina) / 200)),
+        }));
+      s.homeLineup = drainEnergy(s.homeLineup);
+      s.awayLineup = drainEnergy(s.awayLineup);
+
+      s.events = [...prev.events, ...newEvents];
+
+      if (minute >= 90) s.finished = true;
+      return s;
+    });
+  }, [isHome, homeTeam, awayTeam, userTeamId, userSpecAtk, userSpecDef, moraleMult, gkBoost]);
+
+  // ── Game loop ──────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (matchState.finished || paused) return;
+    const speed = TICK_SPEEDS[speedIdx];
+    if (speed === 0) {
+      // Instant: simulate all remaining ticks
+      const simulate = () => {
+        for (let i = matchState.minute; i < 90; i++) simulateTick();
+      };
+      simulate();
+      return;
+    }
+    const timer = setInterval(simulateTick, speed);
+    return () => clearInterval(timer);
+  }, [matchState.finished, paused, speedIdx, simulateTick]);
+
+  // ── Finalizar ──────────────────────────────────────────────────────────────
+
+  const handleFinish = useCallback(() => {
+    const ms = matchStateRef.current;
+
+    // Build match report
+    const goalEvents = ms.events.filter(e => e.type === 'goal').map(e => ({
+      playerId: e.playerId, teamId: e.teamId, minute: e.minute,
+      assistId: e.assistId, isSetPiece: !!e.setPieceType, setPieceType: e.setPieceType,
+    }));
+    const cards = ms.events.filter(e => e.type === 'yellow' || e.type === 'red').map(e => ({
+      playerId: e.playerId, teamId: e.teamId, minute: e.minute, type: e.type as 'yellow' | 'red',
+    }));
+    const injuries = ms.events.filter(e => e.type === 'injury').map(e => ({
+      playerId: e.playerId, teamId: e.teamId, minute: e.minute,
+    }));
+
+    const totalPoss = ms.homePoss + ms.awayPoss || 1;
+
+    // Player ratings
+    const ratingMap = new Map<string, number>();
+    const allPlayed = [...ms.homeLineup, ...ms.awayLineup];
+    for (const p of allPlayed) {
+      let rating = 6.0 + (p.strength - 60) / 80;
+      const goals = goalEvents.filter(g => g.playerId === p.id).length;
+      const assists = goalEvents.filter(g => g.assistId === p.id).length;
+      const reds = cards.filter(c => c.playerId === p.id && c.type === 'red').length;
+      rating += goals * 1.2 + assists * 0.6 - reds * 2.0;
+      ratingMap.set(p.id, Math.max(1, Math.min(10, rating)));
+    }
+
+    const topPerformers = Array.from(ratingMap.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([pid, rating]) => {
+        const p = allPlayed.find(pl => pl.id === pid)!;
+        return { playerId: pid, teamId: p.teamId, rating };
+      });
 
     const report: MatchReport = {
-      homeTeamId: ulm.match.homeTeamId,
-      awayTeamId: ulm.match.awayTeamId,
-      homeScore: ulm.homeScore,
-      awayScore: ulm.awayScore,
-      homeShots: ulm.homeShots,
-      awayShots: ulm.awayShots,
-      homePossession: homePoss,
-      goalEvents: ulm.events.filter(e => e.type === 'goal').map(e => ({
-        playerId: e.playerId, teamId: e.teamId, minute: e.minute, assistId: e.assistId,
-      })),
-      cards: ulm.events.filter(e => e.type === 'yellow' || e.type === 'red').map(e => ({
-        playerId: e.playerId, teamId: e.teamId, minute: e.minute, type: e.type as 'yellow' | 'red',
-      })),
-      injuries: ulm.events.filter(e => e.type === 'injury').map(e => ({
-        playerId: e.playerId, teamId: e.teamId, minute: e.minute,
-      })),
-      topPerformers,
-      isCup: isCupMatch,
+      homeTeamId: homeTeam.id, awayTeamId: awayTeam.id,
+      homeScore: ms.homeScore, awayScore: ms.awayScore,
+      homeShots: ms.homeShots, awayShots: ms.awayShots,
+      homePossession: Math.round((ms.homePoss / totalPoss) * 100),
+      goalEvents, cards, injuries, topPerformers,
+      isCup: !!isCupMatch,
     };
 
-    onComplete(um, playerUpdates, report);
+    // Player updates (energy, cards, goals, assists, minutes)
+    const playerUpdates: Partial<Player>[] = [];
+    for (const p of allPlayed) {
+      const goals = goalEvents.filter(g => g.playerId === p.id).length;
+      const assists = goalEvents.filter(g => g.assistId === p.id).length;
+      const yellows = cards.filter(c => c.playerId === p.id && c.type === 'yellow').length;
+      const reds = cards.filter(c => c.playerId === p.id && c.type === 'red').length;
+      const injured = injuries.some(i => i.playerId === p.id);
+      const medLevel = gameState.staff.medico ?? 0;
+      const injWeeks = injured ? Math.max(1, rng.current.nextInt(1, 6) - medLevel) : 0;
+
+      playerUpdates.push({
+        id: p.id,
+        energy: Math.max(5, Math.round(p.energy * 0.85)),
+        goals: (p.goals ?? 0) + goals,
+        assists: (p.assists ?? 0) + assists,
+        matchesPlayed: (p.matchesPlayed ?? 0) + 1,
+        minutesPlayed: (p.minutesPlayed ?? 0) + 90,
+        yellowCards: p.yellowCards + yellows,
+        redCard: reds > 0 || (p.yellowCards + yellows >= 2),
+        injuryWeeksLeft: Math.max(p.injuryWeeksLeft, injWeeks),
+      });
+    }
+
+    // Updated match
+    const updatedMatches = matches.map(m =>
+      m.id === userMatch.id
+        ? { ...m, homeScore: ms.homeScore, awayScore: ms.awayScore, played: true }
+        : m
+    );
+
+    onComplete(updatedMatches, playerUpdates, report);
+  }, [matches, userMatch, homeTeam, awayTeam, onComplete, isCupMatch, gameState.staff.medico]);
+
+  // Auto-finish when 90 minutes
+  useEffect(() => {
+    if (matchState.finished) {
+      const timer = setTimeout(handleFinish, 600);
+      return () => clearTimeout(timer);
+    }
+  }, [matchState.finished, handleFinish]);
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+
+  const recentEvents = useMemo(() =>
+    [...matchState.events].reverse().slice(0, 12),
+    [matchState.events]
+  );
+
+  const setPieceIcon = (type?: SetPieceType) => {
+    if (type === 'corner') return '🚩';
+    if (type === 'freekick') return '🎯';
+    if (type === 'penalty') return '⚡';
+    return '';
   };
 
-  // ── Render ──────────────────────────────────────────────────────────────────
+  const eventLabel = (e: MatchEvent) => {
+    const team = teams.find(t => t.id === e.teamId);
+    const player = players.find(p => p.id === e.playerId);
+    const teamName = team?.name ?? '?';
+    const playerName = player?.name ?? '';
 
-  const userTeam = gameState.teams.find(t => t.id === gameState.userTeamId)!;
-  const userMatch = state.liveMatches.find(m => m.match.homeTeamId === userTeam.id || m.match.awayTeamId === userTeam.id);
-  if (!userMatch) return null;
+    switch (e.type) {
+      case 'goal': {
+        const sp = e.setPieceType ? ` ${setPieceIcon(e.setPieceType)}` : '';
+        const assist = e.assistId ? ` (${players.find(p => p.id === e.assistId)?.name ?? 'A'})` : '';
+        return `⚽ GOL! ${playerName}${assist}${sp} — ${teamName}`;
+      }
+      case 'yellow': return `🟨 ${playerName} — ${teamName}`;
+      case 'red': return `🟥 ${playerName} — ${teamName}`;
+      case 'corner': return `🚩 Escanteio — ${teamName}`;
+      case 'freekick': return `🎯 Falta perigosa — ${teamName}`;
+      case 'penalty': return `⚡ PÊNALTI! — ${teamName}`;
+      case 'penalty_miss': return `❌ Pênalti perdido — ${playerName}`;
+      case 'sub': {
+        const subIn = players.find(p => p.id === e.subInId);
+        return `🔄 ${playerName} ➜ ${subIn?.name ?? '?'} — ${teamName}`;
+      }
+      case 'injury': return `🏥 Lesão — ${playerName}`;
+      case 'tactical_change': return `📋 Mudança tática: ${e.newFormation} — ${teamName}`;
+      default: return `${e.type} — ${teamName}`;
+    }
+  };
 
-  const otherMatches = state.liveMatches.filter(m => m.match.id !== userMatch.match.id);
-  const isHome = userMatch.match.homeTeamId === userTeam.id;
-  const oppTeam = gameState.teams.find(t => t.id === (isHome ? userMatch.match.awayTeamId : userMatch.match.homeTeamId))!;
-  const leftTeam = isHome ? userTeam : oppTeam;
-  const rightTeam = isHome ? oppTeam : userTeam;
-  const uLIds = isHome ? userMatch.homeLineup : userMatch.awayLineup;
-  const uBIds = isHome ? userMatch.homeBench : userMatch.awayBench;
-  const uSubs = isHome ? userMatch.homeSubs : userMatch.awaySubs;
-  const lp = state.livePlayers;
-  const isDown = (id: string) => lp[id]?.redCard || state.injuredIds.includes(id);
-  const uInjPend = uLIds.filter(id => state.injuredIds.includes(id) && !userMatch.events.some(e => e.type === 'sub' && e.playerId === id));
-  const pct = Math.min(100, (state.minute / 90) * 100);
-  const ce = (type: MatchEvent['type'], tid: string) => userMatch.events.filter(e => e.type === type && e.teamId === tid).length;
+  const totalPoss = matchState.homePoss + matchState.awayPoss || 1;
+  const homePossPercent = Math.round((matchState.homePoss / totalPoss) * 100);
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans flex flex-col">
-      <header className="bg-zinc-900 border-b border-zinc-800 sticky top-0 z-20">
-        <div className="h-0.5 bg-zinc-800"><div className="h-full bg-emerald-500 transition-all duration-300" style={{ width: `${pct}%` }} /></div>
-        <div className="px-4 py-3 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2">
-              {isCupMatch && <span className="flex items-center gap-1 text-amber-400 text-[10px] font-black bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded-full"><Trophy size={9} />COPA</span>}
-              <div className="font-black font-mono text-emerald-400 text-2xl w-14">{state.minute}'</div>
+
+      {/* Placar */}
+      <div className="bg-zinc-900 border-b border-zinc-800 px-4 py-4">
+        <div className="max-w-lg mx-auto">
+          {isCupMatch && <div className="text-center text-amber-400 text-[10px] font-bold mb-2 flex items-center justify-center gap-1"><Trophy size={11} />COPA</div>}
+          <div className="flex items-center justify-center gap-4 mb-3">
+            <div className="flex items-center gap-2 flex-1 justify-end min-w-0">
+              <span className={`font-bold text-sm truncate ${homeTeam.id === userTeamId ? 'text-emerald-400' : ''}`}>{homeTeam.name}</span>
+              <div className="w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center font-bold text-xs" style={{ backgroundColor: homeTeam.color, color: '#fff' }}>{homeTeam.name.charAt(0)}</div>
             </div>
-            <div className="flex gap-1.5">
-              <button onClick={() => setIsPlaying(p => !p)} disabled={state.isFinished} className="p-2 bg-zinc-800 hover:bg-zinc-700 rounded-lg disabled:opacity-40">{isPlaying ? <Pause size={18} /> : <Play size={18} />}</button>
-              <button onClick={() => setSpeed(s => s === 300 ? 50 : 300)} disabled={state.isFinished} className={`p-2 rounded-lg disabled:opacity-40 ${speed === 50 ? 'bg-emerald-500/20 text-emerald-400' : 'bg-zinc-800 hover:bg-zinc-700'}`}><FastForward size={18} /></button>
+            <div className="text-4xl font-black font-mono bg-zinc-950 px-4 py-1.5 rounded-2xl border border-zinc-700 min-w-[90px] text-center">
+              {matchState.homeScore} – {matchState.awayScore}
+            </div>
+            <div className="flex items-center gap-2 flex-1 min-w-0">
+              <div className="w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center font-bold text-xs" style={{ backgroundColor: awayTeam.color, color: '#fff' }}>{awayTeam.name.charAt(0)}</div>
+              <span className={`font-bold text-sm truncate ${awayTeam.id === userTeamId ? 'text-emerald-400' : ''}`}>{awayTeam.name}</span>
             </div>
           </div>
-          <div className="flex items-center gap-2 sm:gap-4">
-            <span className="font-bold text-sm hidden sm:block truncate max-w-[100px]">{leftTeam.name}</span>
-            <div className="font-black font-mono text-xl sm:text-2xl bg-zinc-950 border border-zinc-800 px-3 py-1 rounded-xl">{userMatch.homeScore} - {userMatch.awayScore}</div>
-            <span className="font-bold text-sm hidden sm:block truncate max-w-[100px]">{rightTeam.name}</span>
+
+          {/* Minuto + progresso */}
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-zinc-500 text-[10px] font-mono w-6">{matchState.minute}'</span>
+            <div className="flex-1 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+              <div className="h-full bg-emerald-500 rounded-full transition-all" style={{ width: `${(matchState.minute / 90) * 100}%` }} />
+            </div>
+            <span className="text-zinc-500 text-[10px] font-mono">90'</span>
           </div>
-          {state.isFinished
-            ? <button onClick={finishMatch} className="bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold py-2 px-4 rounded-full flex items-center gap-1.5 text-sm"><Check size={16} /> Continuar</button>
-            : <div className="w-24 hidden sm:block" />}
+
+          {/* Stats rápidas */}
+          <div className="grid grid-cols-3 gap-2 text-center text-[10px]">
+            <div>
+              <div className="font-bold text-xs">{matchState.homeShots}</div>
+              <div className="text-zinc-500">Chutes</div>
+            </div>
+            <div>
+              <div className="flex items-center gap-1 justify-center">
+                <span className="font-bold text-xs">{homePossPercent}%</span>
+                <span className="text-zinc-600">Posse</span>
+                <span className="font-bold text-xs">{100 - homePossPercent}%</span>
+              </div>
+              <div className="flex h-1 bg-zinc-800 rounded-full overflow-hidden">
+                <div className="bg-blue-500 transition-all" style={{ width: `${homePossPercent}%` }} />
+                <div className="bg-red-500 transition-all" style={{ width: `${100 - homePossPercent}%` }} />
+              </div>
+            </div>
+            <div>
+              <div className="font-bold text-xs">{matchState.awayShots}</div>
+              <div className="text-zinc-500">Chutes</div>
+            </div>
+          </div>
+
+          {/* Formações */}
+          <div className="flex items-center justify-between mt-2 text-[9px] text-zinc-500">
+            <span className="flex items-center gap-1"><Shield size={9} />{matchState.homeFormation}</span>
+            <span className="flex items-center gap-1">{matchState.awayFormation}<Shield size={9} /></span>
+          </div>
         </div>
-      </header>
+      </div>
 
-      <div className="flex-1 flex flex-col lg:flex-row max-w-7xl mx-auto w-full">
-        <div className="flex-1 min-w-0 flex flex-col gap-4 p-3 sm:p-5">
+      {/* Controles */}
+      <div className="bg-zinc-900/80 border-b border-zinc-800 px-4 py-2 flex items-center justify-center gap-2">
+        <button onClick={() => setPaused(!paused)} disabled={matchState.finished}
+          className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 text-white font-bold p-2 rounded-xl">
+          {paused ? <Play size={16} /> : <Pause size={16} />}
+        </button>
+        {SPEED_LABELS.map((label, i) => (
+          <button key={i} onClick={() => setSpeedIdx(i)} disabled={matchState.finished}
+            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${speedIdx === i ? 'bg-emerald-500 text-zinc-950' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}>
+            {label}
+          </button>
+        ))}
+      </div>
 
-          {/* Scoreboard */}
-          <div className="hidden sm:block bg-zinc-900 border border-zinc-800 rounded-2xl p-5">
-            <div className="flex items-center justify-between mb-5">
-              {[leftTeam, rightTeam].map(t => (
-                <div key={t.id} className="flex-1 flex flex-col items-center gap-2">
-                  <div className="w-16 h-16 rounded-full flex items-center justify-center text-2xl font-black" style={{ backgroundColor: t.color, color: '#fff' }}>{t.name.charAt(0)}</div>
-                  <span className="font-bold text-center text-sm">{t.name}</span>
-                </div>
-              ))}
-            </div>
-            <div className="text-5xl font-black font-mono tabular-nums text-center -mt-16 mb-5">{userMatch.homeScore} - {userMatch.awayScore}</div>
-            <div className="grid grid-cols-3 gap-2 text-xs text-center max-w-xs mx-auto">
-              {[
-                { label: 'Finalizações', h: isHome ? userMatch.homeShots : userMatch.awayShots, a: isHome ? userMatch.awayShots : userMatch.homeShots },
-                { label: 'Defesas GK', h: isHome ? userMatch.homeSaves : userMatch.awaySaves, a: isHome ? userMatch.awaySaves : userMatch.homeSaves },
-                { label: 'Chances', h: ce('chance', leftTeam.id) + ce('goal', leftTeam.id), a: ce('chance', rightTeam.id) + ce('goal', rightTeam.id) },
-                { label: 'Amarelos', h: ce('yellow', leftTeam.id), a: ce('yellow', rightTeam.id) },
-              ].map(({ label, h, a }) => (
-                <React.Fragment key={label}>
-                  <div className={`font-bold ${label === 'Amarelos' ? 'text-amber-400' : ''}`}>{h}</div>
-                  <div className="text-zinc-500 uppercase tracking-wider">{label}</div>
-                  <div className={`font-bold ${label === 'Amarelos' ? 'text-amber-400' : ''}`}>{a}</div>
-                </React.Fragment>
-              ))}
-            </div>
-          </div>
+      {/* Feed de eventos */}
+      <div className="flex-1 max-w-lg mx-auto w-full px-3 py-3 overflow-y-auto">
+        {matchState.events.length === 0 && (
+          <div className="text-center text-zinc-600 py-8 text-sm">A partida vai começar...</div>
+        )}
+        <div className="space-y-1">
+          {recentEvents.map(e => {
+            const isGoal = e.type === 'goal';
+            const isPenalty = e.type === 'penalty' || e.type === 'penalty_miss';
+            const isCard = e.type === 'yellow' || e.type === 'red';
+            const isTactical = e.type === 'tactical_change';
+            const isSetPieceEvt = e.type === 'corner' || e.type === 'freekick';
 
-          {/* Injury alert */}
-          {uInjPend.length > 0 && (
-            <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl px-4 py-3 flex items-start gap-3">
-              <Bandage size={18} className="text-orange-400 flex-shrink-0 mt-0.5" />
-              <div>
-                <p className="text-orange-400 font-bold text-sm">{uInjPend.map(id => lp[id]?.name).join(', ')} se lesionou!</p>
-                <p className="text-orange-400/70 text-xs mt-0.5">Jogo pausado. Faça a substituição.</p>
-              </div>
-            </div>
-          )}
-
-          {/* Other matches (mobile) */}
-          {otherMatches.length > 0 && (
-            <div className="sm:hidden bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
-              <button onClick={() => setShowOther(s => !s)} className="w-full flex items-center justify-between px-4 py-2.5 text-sm">
-                <span className="flex items-center gap-2 text-zinc-400">
-                  {isCupMatch ? <Trophy size={15} className="text-amber-400" /> : <Activity size={15} />}
-                  {isCupMatch ? 'Copa — outros jogos' : 'Outros placares'}
-                </span>
-                <ChevronDown size={16} className={`text-zinc-500 transition-transform ${showOther ? 'rotate-180' : ''}`} />
-              </button>
-              {showOther && (
-                <div className="border-t border-zinc-800 divide-y divide-zinc-800/50">
-                  {otherMatches.map(lm => {
-                    const h = gameState.teams.find(t => t.id === lm.match.homeTeamId)!;
-                    const a = gameState.teams.find(t => t.id === lm.match.awayTeamId)!;
-                    return (
-                      <div key={lm.match.id} className="flex items-center px-4 py-2 text-xs gap-2">
-                        <span className="flex-1 text-right truncate">{h.name}</span>
-                        <span className="font-mono font-bold bg-zinc-950 px-2 py-0.5 rounded border border-zinc-800">{lm.homeScore}-{lm.awayScore}</span>
-                        <span className="flex-1 truncate">{a.name}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Events */}
-          <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
-            <div className="px-4 py-3 border-b border-zinc-800 text-xs text-zinc-500 font-medium uppercase tracking-wider">Eventos</div>
-            <div className="overflow-y-auto max-h-48 sm:max-h-60 flex flex-col-reverse px-3 py-2 gap-1.5">
-              {userMatch.events.length === 0
-                ? <div className="text-center text-zinc-600 py-4 text-sm">Nenhum evento ainda.</div>
-                : [...userMatch.events].reverse().map(ev => {
-                    if (ev.type === 'foul' || ev.type === 'chance') return null;
-                    const player = lp[ev.playerId];
-                    const assist = ev.assistId ? lp[ev.assistId] : null;
-                    const subIn = ev.subInId ? lp[ev.subInId] : null;
-                    const isU = ev.teamId === userTeam.id;
-                    return (
-                      <div key={ev.id} className={`flex items-center gap-2 text-xs ${isU ? 'flex-row' : 'flex-row-reverse'}`}>
-                        <span className="font-mono text-zinc-600 w-6 text-center flex-shrink-0">{ev.minute}'</span>
-                        <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg max-w-[85%] ${isU ? 'bg-zinc-800/60' : 'bg-zinc-800/30'}`}>
-                          {ev.type === 'goal' && <span className="text-emerald-400 font-bold">⚽ GOL!</span>}
-                          {ev.type === 'yellow' && <div className="w-2 h-3 bg-amber-400 rounded-sm" />}
-                          {ev.type === 'red' && <div className="w-2 h-3 bg-red-500 rounded-sm" />}
-                          {ev.type === 'sub' && <ArrowRightLeft size={12} className="text-blue-400" />}
-                          {ev.type === 'injury' && <Bandage size={12} className="text-orange-400" />}
-                          <span className="font-medium truncate">{player?.name}</span>
-                          {ev.type === 'goal' && assist && <span className="text-zinc-500 truncate hidden sm:inline">(ass: {assist.name})</span>}
-                          {ev.type === 'sub' && subIn && <><span className="text-zinc-600">↔</span><span className="font-medium truncate">{subIn.name}</span></>}
-                          {ev.type === 'injury' && <span className="text-orange-400/70 text-[10px]">lesionado</span>}
-                        </div>
-                      </div>
-                    );
-                  })}
-            </div>
-          </div>
-
-          {/* Team management */}
-          <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
-            <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
-              <span className="font-bold text-sm">Seu Time</span>
-              <span className="text-xs text-zinc-500">Subs: <span className="text-white font-bold">{uSubs}/5</span></span>
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:divide-x divide-zinc-800">
-              <div className="p-3">
-                <div className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-2">Titulares</div>
-                <div className="flex flex-col gap-1">
-                  {uLIds.map(id => {
-                    const p = lp[id];
-                    if (!p) return null;
-                    const sel = selectedSubOut === id;
-                    const inj = state.injuredIds.includes(id);
-                    const down = isDown(id);
-                    return (
-                      <div key={id}
-                        onClick={() => { if (!down || inj) setSelectedSubOut(prev => prev === id ? null : id); }}
-                        className={`flex items-center gap-2 p-2 rounded-lg transition-colors
-                          ${down && !inj ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}
-                          ${sel ? 'bg-blue-500/15 border border-blue-500/40' : inj ? 'bg-orange-500/10 border border-orange-500/25' : 'hover:bg-zinc-800/60'}`}>
-                        <span className="text-[10px] font-bold text-zinc-500 w-4">{p.position}</span>
-                        <span className={`font-medium text-xs flex-1 truncate ${inj ? 'text-orange-400' : ''}`}>{p.name}</span>
-                        {inj && <Bandage size={11} className="text-orange-400" />}
-                        {p.redCard && !inj && <div className="w-2 h-3 bg-red-500 rounded-sm" />}
-                        {!p.redCard && !inj && p.yellowCards > 0 && <div className="w-2 h-3 bg-amber-400 rounded-sm" />}
-                        <div className="flex items-center gap-1.5">
-                          <div className="w-10 h-1 bg-zinc-800 rounded-full overflow-hidden">
-                            <div className={`h-full ${p.energy > 60 ? 'bg-emerald-500' : p.energy > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.energy}%` }} />
-                          </div>
-                          <span className="text-[10px] font-mono text-zinc-500 w-5">{p.strength}</span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-              <div className="p-3">
-                <div className="text-xs font-bold text-zinc-500 uppercase tracking-wider mb-2">Banco</div>
-                {uBIds.length === 0
-                  ? <p className="text-xs text-zinc-600 p-2">Sem reservas.</p>
-                  : (
-                    <div className="flex flex-col gap-1">
-                      {uBIds.map(id => {
-                        const p = lp[id];
-                        if (!p) return null;
-                        return (
-                          <div key={id}
-                            onClick={() => selectedSubOut && (() => {
-                              dispatch({ type: 'USER_SUB', subOutId: selectedSubOut, subInId: id, userTeamId: userTeam.id, minute: state.minute });
-                              setSelectedSubOut(null);
-                            })()}
-                            className={`flex items-center gap-2 p-2 rounded-lg ${selectedSubOut ? 'cursor-pointer hover:bg-zinc-800/80 border border-zinc-700' : 'opacity-40'}`}>
-                            <span className="text-[10px] font-bold text-zinc-500 w-4">{p.position}</span>
-                            <span className="font-medium text-xs flex-1 truncate">{p.name}</span>
-                            <div className="flex items-center gap-1.5">
-                              <div className="w-10 h-1 bg-zinc-800 rounded-full overflow-hidden">
-                                <div className={`h-full ${p.energy > 60 ? 'bg-emerald-500' : p.energy > 30 ? 'bg-amber-500' : 'bg-red-500'}`} style={{ width: `${p.energy}%` }} />
-                              </div>
-                              <span className="text-[10px] font-mono text-zinc-500 w-5">{p.strength}</span>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                {selectedSubOut && (
-                  <div className="mt-2 p-2 bg-blue-500/10 border border-blue-500/20 rounded-lg flex items-start gap-1.5 text-xs text-blue-400">
-                    <AlertCircle size={13} className="mt-0.5" />
-                    <p>Escolha reserva para <strong>{lp[selectedSubOut]?.name}</strong>.</p>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {state.isFinished && (
-            <button onClick={finishMatch} className="sm:hidden w-full bg-emerald-500 text-zinc-950 font-bold py-4 rounded-xl flex items-center justify-center gap-2">
-              <Check size={20} /> Continuar
-            </button>
-          )}
-        </div>
-
-        {/* Sidebar */}
-        <aside className="hidden lg:flex flex-col w-56 flex-shrink-0 border-l border-zinc-800 p-4 gap-3">
-          <div className="flex items-center gap-2 text-sm font-bold text-zinc-400">
-            {isCupMatch ? <><Trophy size={16} className="text-amber-400" />Copa</> : <><Activity size={16} className="text-emerald-400" />Ao Vivo</>}
-          </div>
-          {otherMatches.map(lm => {
-            const h = gameState.teams.find(t => t.id === lm.match.homeTeamId)!;
-            const a = gameState.teams.find(t => t.id === lm.match.awayTeamId)!;
             return (
-              <div key={lm.match.id} className="bg-zinc-900 border border-zinc-800 rounded-xl p-2.5 text-xs">
-                <div className="flex items-center justify-between mb-1">
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: h.color }} />
-                    <span className="truncate">{h.name}</span>
-                  </div>
-                  <span className="font-mono font-bold ml-1">{lm.homeScore}</span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: a.color }} />
-                    <span className="truncate">{a.name}</span>
-                  </div>
-                  <span className="font-mono font-bold ml-1">{lm.awayScore}</span>
-                </div>
+              <div key={e.id} className={`flex items-start gap-2 px-3 py-2 rounded-xl text-xs transition-all ${
+                isGoal ? 'bg-emerald-500/10 border border-emerald-500/30 font-bold' :
+                isPenalty ? 'bg-amber-500/10 border border-amber-500/30' :
+                isCard ? 'bg-zinc-800/50 border border-zinc-800' :
+                isTactical ? 'bg-blue-500/10 border border-blue-500/20' :
+                isSetPieceEvt ? 'bg-zinc-800/30 border border-zinc-800/50' :
+                'bg-zinc-900/50 border border-zinc-800/30'
+              }`}>
+                <span className="font-mono text-zinc-500 w-6 flex-shrink-0 text-right">{e.minute}'</span>
+                <span className={`flex-1 ${isGoal ? 'text-emerald-400' : isPenalty ? 'text-amber-400' : ''}`}>
+                  {eventLabel(e)}
+                </span>
               </div>
             );
           })}
-        </aside>
+        </div>
       </div>
+
+      {/* Status final */}
+      {matchState.finished && (
+        <div className="bg-zinc-900 border-t border-zinc-800 px-4 py-3 text-center">
+          <div className="text-zinc-400 text-xs mb-1">Fim de jogo</div>
+          <div className="text-2xl font-black">
+            {matchState.homeScore > matchState.awayScore
+              ? (homeTeam.id === userTeamId ? '✅ Vitória!' : '❌ Derrota')
+              : matchState.homeScore < matchState.awayScore
+                ? (awayTeam.id === userTeamId ? '✅ Vitória!' : '❌ Derrota')
+                : '🤝 Empate'}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
