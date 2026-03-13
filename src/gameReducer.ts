@@ -3,7 +3,7 @@ import {
   StaffRole, Specialization, FORMATIONS, TOTAL_SEASON_ROUNDS,
   TRANSFER_WINDOW_ROUNDS, CupRound, CUP_UNLOCK_AFTER,
   SeasonSummary, SeasonRecord, Objective,
-  ACADEMY_INFO,
+  ACADEMY_INFO, STAFF_INFO,   // ← STAFF_INFO adicionado aqui (era require() antes)
 } from './types';
 import {
   computeOverall, getBestLineup, getEffectiveStrength,
@@ -42,7 +42,6 @@ function addFinance(team: Team, round: number, type: 'income' | 'expense', categ
     id: `fin_${team.finances.length}_${round}`,
     round, type, category: category as any, amount, description,
   }];
-  // Keep last 50 transactions per team
   const trimmed = finances.length > 50 ? finances.slice(-50) : finances;
   return { ...team, finances: trimmed };
 }
@@ -97,7 +96,6 @@ function simCupMatch(state: GameState, match: { homeTeamId: string; awayTeamId: 
   let homeScore = Math.max(0, Math.round((homeAtk - awayDef * 0.4) / 30 + 0.3 + (Math.random() - 0.3)));
   let awayScore = Math.max(0, Math.round((awayAtk - homeDef * 0.4) / 30 + 0.2 + (Math.random() - 0.3)));
 
-  // No draws in cup — extra time / penalties simplified
   if (homeScore === awayScore) {
     if (Math.random() < 0.5) homeScore++; else awayScore++;
   }
@@ -114,7 +112,6 @@ function runAIMarket(state: GameState): GameState {
   const aiTeams = teams.filter(t => t.id !== state.userTeamId);
 
   for (const team of aiTeams) {
-    // Sell: list low-value players
     const squad = players.filter(p => p.teamId === team.id);
     if (squad.length > 16) {
       const weakest = [...squad].sort((a, b) => a.strength - b.strength).slice(0, 2);
@@ -124,7 +121,6 @@ function runAIMarket(state: GameState): GameState {
       });
     }
 
-    // Buy: if team is weak, try to buy a player
     const avgStr = squad.length > 0 ? squad.reduce((s, p) => s + p.strength, 0) / squad.length : 50;
     if (team.money > 1_000_000 && squad.length < 18) {
       const available = players.filter(p =>
@@ -173,7 +169,6 @@ function processPostMatch(state: GameState, report: MatchReport, playerUpdates: 
   const teamDrew = userScore === oppScore;
   const teamLost = userScore < oppScore;
 
-  // Apply player updates from live match (energy, goals, assists, minutes, cards)
   for (const update of playerUpdates) {
     const idx = players.findIndex(p => p.id === update.id);
     if (idx >= 0) {
@@ -181,7 +176,6 @@ function processPostMatch(state: GameState, report: MatchReport, playerUpdates: 
     }
   }
 
-  // Apply form delta for user players
   for (const p of players.filter(pl => pl.teamId === userTeamId)) {
     const played = playerUpdates.some(u => u.id === p.id);
     const goalsScored = report.goalEvents.filter(g => g.playerId === p.id).length;
@@ -200,7 +194,6 @@ function processPostMatch(state: GameState, report: MatchReport, playerUpdates: 
     }
   }
 
-  // Ticket income (home matches)
   if (isHome) {
     const team = teams.find(t => t.id === userTeamId)!;
     const attendance = Math.min(team.stadium.capacity, Math.round(team.stadium.capacity * (0.5 + team.fanSatisfaction / 200)));
@@ -212,14 +205,12 @@ function processPostMatch(state: GameState, report: MatchReport, playerUpdates: 
     );
   }
 
-  // Update manager stats
   const manager = { ...state.manager };
   manager.matchesManaged++;
   if (teamWon) manager.wins++;
   else if (teamDrew) manager.draws++;
   else manager.losses++;
 
-  // Fan satisfaction
   const userTeamIdx = teams.findIndex(t => t.id === userTeamId);
   const fanDelta = teamWon ? 3 : teamDrew ? 0 : -4;
   teams[userTeamIdx] = {
@@ -238,16 +229,13 @@ function advanceCup(state: GameState): GameState {
   const cup = { ...state.cup, matches: [...state.cup.matches] };
   const currentMatches = cup.matches.filter(m => m.round === cup.currentRound);
 
-  // Check if all current round matches are played
   if (!currentMatches.every(m => m.played)) return { ...state, cup };
 
-  // Determine next round
   const roundOrder: CupRound[] = ['r16', 'qf', 'sf', 'final', 'done'];
   const currentIdx = roundOrder.indexOf(cup.currentRound);
   const nextRound = roundOrder[currentIdx + 1] as CupRound;
 
   if (nextRound === 'done') {
-    // Final was played
     const finalMatch = currentMatches[0];
     cup.winnerId = finalMatch.winnerId;
     cup.currentRound = 'done';
@@ -255,7 +243,6 @@ function advanceCup(state: GameState): GameState {
     return { ...state, cup, pendingCupRound: null };
   }
 
-  // Generate next round matches from winners
   const winners = currentMatches.map(m => m.winnerId!);
   const nextMatches = [];
   for (let i = 0; i < winners.length; i += 2) {
@@ -273,7 +260,6 @@ function advanceCup(state: GameState): GameState {
   cup.matches = [...cup.matches, ...nextMatches];
   cup.currentRound = nextRound;
 
-  // Check if user is still in cup
   const userInNext = nextMatches.some(m => m.homeTeamId === state.userTeamId || m.awayTeamId === state.userTeamId);
   if (!userInNext && !currentMatches.some(m => m.winnerId === state.userTeamId)) {
     const roundLabels: Record<CupRound, string> = { r16: 'Eliminado nas Oitavas', qf: 'Eliminado nas Quartas', sf: 'Eliminado na Semi', final: 'Vice-campeão', done: '' };
@@ -292,7 +278,6 @@ function simAICupMatches(state: GameState): GameState {
   const currentMatches = cup.matches.filter(m => m.round === cup.currentRound && !m.played);
 
   for (const match of currentMatches) {
-    // Skip user's match
     if (match.homeTeamId === state.userTeamId || match.awayTeamId === state.userTeamId) continue;
 
     const result = simCupMatch(state, match);
@@ -310,6 +295,89 @@ function simAICupMatches(state: GameState): GameState {
 }
 
 // ─── Season End ───────────────────────────────────────────────────────────────
+// Dividida em subfunções para melhor legibilidade (melhoria #9 da análise)
+
+function applyRetirements(players: Player[]): { players: Player[]; retired: string[] } {
+  const retired: string[] = [];
+  const remaining = players.filter(p => {
+    if (p.age >= 37 && Math.random() < 0.6) { retired.push(p.name); return false; }
+    if (p.age >= 39) { retired.push(p.name); return false; }
+    return true;
+  });
+  return { players: remaining, retired };
+}
+
+function processPromoRelegation(teams: Team[], matches: Match[]): { teams: Team[]; promoted: string[]; relegated: string[] } {
+  const promoted: string[] = [];
+  const relegated: string[] = [];
+  const updatedTeams = teams.map(t => ({ ...t }));
+
+  for (const league of [1, 2, 3]) {
+    const standings = computeStandings(updatedTeams, matches, league);
+    if (league > 1) {
+      standings.slice(0, 2).forEach(t => {
+        promoted.push(t.id);
+        const idx = updatedTeams.findIndex(tm => tm.id === t.id);
+        if (idx >= 0) updatedTeams[idx] = { ...updatedTeams[idx], league: league - 1 };
+      });
+    }
+    if (league < 3) {
+      standings.slice(-2).forEach(t => {
+        relegated.push(t.id);
+        const idx = updatedTeams.findIndex(tm => tm.id === t.id);
+        if (idx >= 0) updatedTeams[idx] = { ...updatedTeams[idx], league: league + 1 };
+      });
+    }
+  }
+
+  return { teams: updatedTeams, promoted, relegated };
+}
+
+function generateYouthPlayers(state: GameState, userTeamId: string): { players: Player[]; names: string[] } {
+  const userTeam = state.teams.find(t => t.id === userTeamId)!;
+  const academyLevel = userTeam.academyLevel;
+  const generated: Player[] = [];
+  const names: string[] = [];
+
+  if (academyLevel > 0) {
+    const info = ACADEMY_INFO[academyLevel];
+    for (let i = 0; i < info.youthPerSeason; i++) {
+      const pos: ('D' | 'M' | 'A')[] = ['D', 'M', 'A'];
+      const rPos = pos[Math.floor(Math.random() * pos.length)];
+      const baseStr = 30 + info.qualityBonus + Math.floor(Math.random() * 15);
+      const youth = generatePlayer(userTeamId, rPos, baseStr, [16, 18], true);
+      generated.push(youth);
+      names.push(youth.name);
+    }
+  }
+
+  return { players: generated, names };
+}
+
+function evaluateObjectives(
+  objectives: Objective[],
+  userPosition: number,
+  cup: GameState['cup'],
+  userTeamId: string,
+  managerWins: number,
+): Objective[] {
+  return objectives.map(obj => {
+    const o = { ...obj };
+    if (o.type === 'league_position') o.achieved = userPosition <= o.target;
+    if (o.type === 'no_relegation') o.achieved = userPosition < o.target;
+    if (o.type === 'cup_round') {
+      const cupRounds = ['r16', 'qf', 'sf', 'final'];
+      const result = cup?.userCupResult ?? '';
+      const cupIdx = result.includes('Quartas') ? 1
+        : result.includes('Semi') ? 2
+        : (result.includes('Campeão') || result.includes('Vice')) ? 3
+        : 0;
+      o.achieved = cupIdx >= o.target;
+    }
+    if (o.type === 'win_count') o.achieved = managerWins >= o.target;
+    return o;
+  });
+}
 
 function processSeasonEnd(state: GameState): GameState {
   let s = { ...state };
@@ -318,14 +386,14 @@ function processSeasonEnd(state: GameState): GameState {
 
   const userTeamId = s.userTeamId!;
 
-  // Apply age progression (with minutes-played factor)
+  // 1. Progressão por idade
   for (let i = 0; i < s.players.length; i++) {
     const p = s.players[i];
     const prog = applyAgeProgression(p);
     s.players[i] = { ...p, ...prog, age: p.age + 1 };
   }
 
-  // Energy recovery for AI
+  // 2. Recuperação de energia
   for (let i = 0; i < s.players.length; i++) {
     const prepLevel = s.staff.preparador ?? 0;
     const energyBoost = 80 + prepLevel * 5;
@@ -334,116 +402,72 @@ function processSeasonEnd(state: GameState): GameState {
       energy: Math.min(100, energyBoost + Math.floor(Math.random() * 15)),
       yellowCards: 0, redCard: false,
       matchesPlayed: 0, goals: 0, assists: 0,
-      minutesPlayed: 0, // Reset minutes for new season
+      minutesPlayed: 0,
       formStreak: 0, trainingProgress: 0,
     };
   }
 
-  // Retirements (age 37+)
-  const retired: string[] = [];
-  s.players = s.players.filter(p => {
-    if (p.age >= 37 && Math.random() < 0.6) { retired.push(p.name); return false; }
-    if (p.age >= 39) { retired.push(p.name); return false; }
-    return true;
-  });
+  // 3. Aposentadorias
+  const { players: remainingPlayers, retired } = applyRetirements(s.players);
+  s.players = remainingPlayers;
 
-  // Standings & promotion/relegation per league
-  const promoted: string[] = [];
-  const relegated: string[] = [];
+  // 4. Promoção/rebaixamento
+  const { teams: updatedTeams, promoted, relegated } = processPromoRelegation(s.teams, s.matches);
+  s.teams = updatedTeams;
 
-  for (const league of [1, 2, 3]) {
-    const standings = computeStandings(s.teams, s.matches, league);
-    // Top 2 promote (except league 1)
-    if (league > 1) {
-      standings.slice(0, 2).forEach(t => {
-        promoted.push(t.id);
-        const idx = s.teams.findIndex(tm => tm.id === t.id);
-        if (idx >= 0) s.teams[idx] = { ...s.teams[idx], league: league - 1 };
-      });
-    }
-    // Bottom 2 relegate (except league 3)
-    if (league < 3) {
-      standings.slice(-2).forEach(t => {
-        relegated.push(t.id);
-        const idx = s.teams.findIndex(tm => tm.id === t.id);
-        if (idx >= 0) s.teams[idx] = { ...s.teams[idx], league: league + 1 };
-      });
-    }
-  }
-
-  // User's final position
-  const userTeam = s.teams.find(t => t.id === userTeamId)!;
-  const userStandings = computeStandings(s.teams.map(t => {
-    // Use pre-promotion/relegation league for standings
-    const original = state.teams.find(ot => ot.id === t.id);
-    return original ? { ...t, league: original.league } : t;
-  }), s.matches, state.teams.find(t => t.id === userTeamId)!.league);
-  const userPosition = userStandings.findIndex(t => t.id === userTeamId) + 1;
+  // 5. Posição final do usuário (usa liga original antes do recálculo)
   const userLeague = state.teams.find(t => t.id === userTeamId)!.league;
+  const userStandings = computeStandings(
+    s.teams.map(t => {
+      const original = state.teams.find(ot => ot.id === t.id);
+      return original ? { ...t, league: original.league } : t;
+    }),
+    s.matches,
+    userLeague,
+  );
+  const userPosition = userStandings.findIndex(t => t.id === userTeamId) + 1;
 
-  // Top scorer
+  // 6. Artilheiro
   const scorers = state.players.filter(p => p.goals > 0).sort((a, b) => b.goals - a.goals);
   const topScorer = scorers[0] ? {
     name: scorers[0].name, goals: scorers[0].goals,
     team: state.teams.find(t => t.id === scorers[0].teamId)?.name ?? '',
   } : null;
 
-  // Cup result
+  // 7. Copa
   const cupResult = s.cup?.winnerId === userTeamId ? 'Campeão'
     : s.cup?.userCupResult ?? 'Não participou';
 
-  // Youth generation
-  const youthGenerated: string[] = [];
-  const academyLevel = userTeam.academyLevel;
-  if (academyLevel > 0) {
-    const info = ACADEMY_INFO[academyLevel];
-    for (let i = 0; i < info.youthPerSeason; i++) {
-      const pos: ('D' | 'M' | 'A')[] = ['D', 'M', 'A'];
-      const rPos = pos[Math.floor(Math.random() * pos.length)];
-      const baseStr = 30 + info.qualityBonus + Math.floor(Math.random() * 15);
-      const youth = generatePlayer(userTeamId, rPos, baseStr, [16, 18], true);
-      s.players.push(youth);
-      youthGenerated.push(youth.name);
-    }
-  }
+  // 8. Academia
+  const { players: youthPlayers, names: youthGenerated } = generateYouthPlayers(s, userTeamId);
+  s.players = [...s.players, ...youthPlayers];
 
-  // Sponsorship income
-  const tIdx = s.teams.findIndex(t => t.id === userTeamId);
+  // 9. Financeiro: patrocínio, salários, manutenção
+  let tIdx = s.teams.findIndex(t => t.id === userTeamId);
   s.teams[tIdx] = addFinance(
     { ...s.teams[tIdx], money: s.teams[tIdx].money + s.teams[tIdx].sponsorshipIncome },
     TOTAL_SEASON_ROUNDS, 'income', 'sponsorship',
     s.teams[tIdx].sponsorshipIncome, 'Patrocínio anual',
   );
 
-  // Salary costs
   const totalSalary = s.players.filter(p => p.teamId === userTeamId).reduce((sum, p) => sum + p.salary, 0);
   s.teams[tIdx] = addFinance(
     { ...s.teams[tIdx], money: s.teams[tIdx].money - totalSalary },
     TOTAL_SEASON_ROUNDS, 'expense', 'salaries', totalSalary, 'Folha salarial anual',
   );
 
-  // Stadium maintenance
   s.teams[tIdx] = addFinance(
     { ...s.teams[tIdx], money: s.teams[tIdx].money - s.teams[tIdx].stadium.maintenanceCost },
     TOTAL_SEASON_ROUNDS, 'expense', 'maintenance', s.teams[tIdx].stadium.maintenanceCost, 'Manutenção estádio',
   );
 
-  // Objectives evaluation
-  const objectives = state.objectives.map(obj => {
-    const o = { ...obj };
-    if (o.type === 'league_position') o.achieved = userPosition <= o.target;
-    if (o.type === 'no_relegation') o.achieved = userPosition < o.target;
-    if (o.type === 'cup_round') {
-      const cupRounds = ['r16', 'qf', 'sf', 'final'];
-      const userCupRoundIdx = s.cup ? cupRounds.indexOf(s.cup.userCupResult.includes('Quartas') ? 'qf' : s.cup.userCupResult.includes('Semi') ? 'sf' : s.cup.userCupResult.includes('Campeão') || s.cup.userCupResult.includes('Vice') ? 'final' : 'r16') : 0;
-      o.achieved = userCupRoundIdx >= o.target;
-    }
-    if (o.type === 'win_count') o.achieved = state.manager.wins >= o.target;
-    return o;
-  });
+  // 10. Objetivos
+  const objectives = evaluateObjectives(
+    state.objectives, userPosition, s.cup, userTeamId, state.manager.wins,
+  );
 
-  // Objective rewards
   let objAchieved = 0;
+  tIdx = s.teams.findIndex(t => t.id === userTeamId); // re-fetch após mutações
   for (const obj of objectives) {
     if (obj.achieved) {
       objAchieved++;
@@ -455,7 +479,7 @@ function processSeasonEnd(state: GameState): GameState {
     }
   }
 
-  // Manager rep update
+  // 11. Reputação do técnico
   const isChampion = userPosition === 1;
   const manager = { ...s.manager };
   if (isChampion) {
@@ -467,12 +491,12 @@ function processSeasonEnd(state: GameState): GameState {
     manager.reputation = Math.max(1, manager.reputation - 8);
   }
 
-  // Season record
+  // 12. Registro da temporada
   const record: SeasonRecord = {
     season: state.season, league: userLeague, position: userPosition,
     wins: state.manager.wins, draws: state.manager.draws, losses: state.manager.losses,
-    goalsFor: state.players.filter(p => p.teamId === userTeamId).reduce((s, p) => s + p.goals, 0),
-    goalsAgainst: 0, // Could compute from matches
+    goalsFor: state.players.filter(p => p.teamId === userTeamId).reduce((acc, p) => acc + p.goals, 0),
+    goalsAgainst: 0,
     cupResult,
     promoted: promoted.includes(userTeamId),
     relegated: relegated.includes(userTeamId),
@@ -489,11 +513,10 @@ function processSeasonEnd(state: GameState): GameState {
     cupResult, objectivesAchieved: objAchieved, objectivesTotal: objectives.length,
   };
 
-  // Contract years decrement
+  // 13. Expiração de contratos
   for (let i = 0; i < s.players.length; i++) {
     s.players[i] = { ...s.players[i], contractYears: Math.max(0, s.players[i].contractYears - 1) };
   }
-  // Free agents (contract expired, not user's team)
   s.players = s.players.filter(p => p.contractYears > 0 || p.teamId === userTeamId);
 
   return {
@@ -539,7 +562,6 @@ export function gameReducer(state: GameState | null, action: GameAction): GameSt
         lineup = lineup.filter(id => id !== playerId);
       } else {
         if (lineup.length >= 11) return state;
-        // Check position slots
         const slots = FORMATIONS[state.formation];
         const currentCount: Record<string, number> = { G: 0, D: 0, M: 0, A: 0 };
         for (const id of lineup) {
@@ -679,7 +701,7 @@ export function gameReducer(state: GameState | null, action: GameAction): GameSt
 
     case 'HIRE_STAFF': {
       const { role } = action.payload;
-      const { STAFF_INFO } = require('./types');
+      // ✅ STAFF_INFO agora vem do import estático no topo do arquivo (não mais require())
       const info = STAFF_INFO[role];
       const currentLevel = state.staff[role] ?? 0;
       if (currentLevel >= 3) return state;
@@ -706,13 +728,11 @@ export function gameReducer(state: GameState | null, action: GameAction): GameSt
     case 'MATCH_DAY_COMPLETE': {
       const { updatedMatches, playerUpdates, report } = action.payload;
 
-      // Update matches
       let newMatches = state.matches.map(m => {
         const updated = updatedMatches.find(u => u.id === m.id);
         return updated ?? m;
       });
 
-      // Simulate other AI matches of the same round
       const aiMatches = newMatches.filter(m => m.round === state.currentRound && !m.played);
       newMatches = newMatches.map(m => {
         if (aiMatches.includes(m)) return simMatch(state, m);
@@ -720,16 +740,12 @@ export function gameReducer(state: GameState | null, action: GameAction): GameSt
       });
 
       let newState = { ...state, matches: newMatches };
-
-      // Post-match processing (form, tickets, manager stats)
       newState = processPostMatch(newState, report, playerUpdates);
 
-      // AI market during transfer windows
       if (TRANSFER_WINDOW_ROUNDS.has(state.currentRound)) {
         newState = runAIMarket(newState);
       }
 
-      // Injury recovery + energy recovery for all
       const prepLevel = state.staff.preparador ?? 0;
       newState = {
         ...newState,
@@ -739,16 +755,14 @@ export function gameReducer(state: GameState | null, action: GameAction): GameSt
           energy: p.teamId === state.userTeamId
             ? Math.min(100, p.energy + 8 + prepLevel * 5)
             : Math.min(100, p.energy + 10),
-          redCard: p.redCard ? false : p.redCard, // Clear red cards after 1 round
+          redCard: p.redCard ? false : p.redCard,
         })),
       };
 
-      // Check cup unlock
       let pendingCupRound: CupRound | null = null;
       if (newState.cup && newState.cup.currentRound !== 'done') {
         const unlockRound = CUP_UNLOCK_AFTER[newState.cup.currentRound];
         if (unlockRound && state.currentRound >= unlockRound) {
-          // Sim AI cup matches first
           newState = simAICupMatches(newState);
           const userCupMatch = newState.cup!.matches.find(m =>
             m.round === newState.cup!.currentRound && !m.played &&
@@ -757,13 +771,11 @@ export function gameReducer(state: GameState | null, action: GameAction): GameSt
           if (userCupMatch) {
             pendingCupRound = newState.cup!.currentRound;
           } else {
-            // User already eliminated, advance
             newState = advanceCup(newState);
           }
         }
       }
 
-      // Advance round
       const nextRound = state.currentRound + 1;
       if (nextRound > TOTAL_SEASON_ROUNDS) {
         newState = processSeasonEnd(newState);
@@ -788,7 +800,6 @@ export function gameReducer(state: GameState | null, action: GameAction): GameSt
         };
       }
 
-      // Apply player updates
       let newState = {
         ...state,
         cup,
@@ -798,14 +809,11 @@ export function gameReducer(state: GameState | null, action: GameAction): GameSt
         }),
       };
 
-      // Advance cup
       newState = advanceCup(newState);
-
       return { ...newState, pendingCupRound: null };
     }
 
     case 'START_NEW_SEASON': {
-      // Generate new fixtures
       const newMatches: Match[] = [];
       for (const league of [1, 2, 3]) {
         const leagueTeams = state.teams.filter(t => t.league === league).map(t => t.id);

@@ -11,16 +11,8 @@ import {
   getAIMidMatchFormationChange, getAISubstitutionTarget, findBestSubIn,
   computeLeadershipBoost, pickWeightedPlayer, AttackOutcome,
 } from './engine';
+import { RNG } from './rng'; // ← usa o RNG robusto de rng.ts (fix #4 antecipado)
 import { Play, Pause, FastForward, SkipForward, Trophy, Swords, Shield, Zap } from 'lucide-react';
-
-// ─── Seeded RNG ───────────────────────────────────────────────────────────────
-
-class SeededRNG {
-  private state: number;
-  constructor(seed: number) { this.state = seed % 2147483647; if (this.state <= 0) this.state += 2147483646; }
-  next(): number { this.state = (this.state * 16807) % 2147483647; return (this.state - 1) / 2147483646; }
-  nextInt(min: number, max: number): number { return min + Math.floor(this.next() * (max - min + 1)); }
-}
 
 // ─── Tipos internos ───────────────────────────────────────────────────────────
 
@@ -61,10 +53,25 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
   const homeTeam = teams.find(t => t.id === userMatch.homeTeamId)!;
   const awayTeam = teams.find(t => t.id === userMatch.awayTeamId)!;
 
-  const rng = useRef(new SeededRNG(Date.now()));
+  // ── RNG: usa o Mulberry32 de rng.ts com seed derivada do matchId ──────────
+  // Seed determinística: mesma partida sempre produz a mesma sequência
+  const matchSeed = useMemo(() => {
+    let hash = 0;
+    for (let i = 0; i < userMatch.id.length; i++) {
+      hash = ((hash << 5) - hash + userMatch.id.charCodeAt(i)) | 0;
+    }
+    return Math.abs(hash) + Date.now();
+  }, [userMatch.id]);
+
+  const rng = useRef(new RNG(matchSeed));
+
+  // ── Spec modifiers ─────────────────────────────────────────────────────────
+  const userSpec = gameState.manager.specialization;
+  const userSpecAtk = userSpec === 'ofensivo' ? 1.15 : 1.0;
+  const userSpecDef = userSpec === 'defensivo' ? 1.15 : 1.0;
+  const gkBoost = gameState.staff.goleiros ?? 0;
 
   // ── Inicializar estado da partida ──────────────────────────────────────────
-
   const initMatchState = useCallback((): MatchState => {
     const allHomePlayers = players.filter(p => p.teamId === homeTeam.id && !p.redCard && p.injuryWeeksLeft === 0);
     const allAwayPlayers = players.filter(p => p.teamId === awayTeam.id && !p.redCard && p.injuryWeeksLeft === 0);
@@ -112,325 +119,262 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
   const matchStateRef = useRef(matchState);
   matchStateRef.current = matchState;
 
-  // ── Spec modifiers ─────────────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+  // FUNÇÃO PURA DE TICK
+  // Recebe o estado atual e retorna o próximo estado — sem tocar no React.
+  // Isso permite tanto o loop incremental (setInterval) quanto o loop
+  // instant (simular tudo de uma vez antes de chamar setMatchState).
+  // ══════════════════════════════════════════════════════════════════════════
 
-  const userSpec = gameState.manager.specialization;
-  const userSpecAtk = userSpec === 'ofensivo' ? 1.15 : 1.0;
-  const userSpecDef = userSpec === 'defensivo' ? 1.15 : 1.0;
-  const moraleMult = userSpec === 'motivador' ? 2.0 : 1.0;
+  const applyTick = useCallback((prev: MatchState): MatchState => {
+    if (prev.finished || prev.minute >= 90) return { ...prev, finished: true };
 
-  // ── GK boost (staff) ──────────────────────────────────────────────────────
+    const s = { ...prev };
+    const minute = s.minute + 1;
+    s.minute = minute;
+    const rand = () => rng.current.next();
+    const newEvents: MatchEvent[] = [];
 
-  const gkBoost = gameState.staff.goleiros ?? 0;
+    // ── AI mid-match formation change ──────────────────────────────────────
+    const aiIsHome = !isHome;
+    const aiTeamScore = aiIsHome ? s.homeScore : s.awayScore;
+    const aiOppScore = aiIsHome ? s.awayScore : s.homeScore;
 
-  // ── Tick do jogo ───────────────────────────────────────────────────────────
+    const newAIFormation = getAIMidMatchFormationChange(
+      s.awayStyle,
+      aiIsHome ? s.homeFormation : s.awayFormation,
+      aiTeamScore, aiOppScore, minute, rand,
+    );
+    if (newAIFormation) {
+      if (aiIsHome) s.homeFormation = newAIFormation;
+      else s.awayFormation = newAIFormation;
+      newEvents.push({
+        id: `tc_${minute}`, minute, type: 'tactical_change',
+        teamId: aiIsHome ? homeTeam.id : awayTeam.id,
+        playerId: '', newFormation: newAIFormation,
+      });
+    }
 
-  const simulateTick = useCallback(() => {
-    setMatchState(prev => {
-      if (prev.finished || prev.minute >= 90) return { ...prev, finished: true };
+    // ── AI substitutions (max 3) ──────────────────────────────────────────
+    const aiLineup = aiIsHome ? s.homeLineup : s.awayLineup;
+    const aiBench = aiIsHome ? s.homeBench : s.awayBench;
+    const aiSubs = aiIsHome ? s.homeSubs : s.awaySubs;
+    const aiInjured = aiIsHome ? s.homeInjured : s.awayInjured;
 
-      const s = { ...prev };
-      const minute = s.minute + 1;
-      s.minute = minute;
-      const rand = () => rng.current.next();
-      const newEvents: MatchEvent[] = [];
-
-      // ── AI mid-match formation change ──────────────────────────────────
-      const aiIsHome = !isHome;
-      const aiTeamScore = aiIsHome ? s.homeScore : s.awayScore;
-      const aiOppScore = aiIsHome ? s.awayScore : s.homeScore;
-
-      const newAIFormation = getAIMidMatchFormationChange(
-        s.awayStyle,
-        aiIsHome ? s.homeFormation : s.awayFormation,
-        aiTeamScore, aiOppScore, minute, rand,
+    if (aiSubs < 3 && minute > 45) {
+      const subTarget = getAISubstitutionTarget(
+        s.awayStyle, aiLineup, aiBench,
+        aiTeamScore, aiOppScore, minute, aiInjured,
       );
-      if (newAIFormation) {
-        if (aiIsHome) s.homeFormation = newAIFormation;
-        else s.awayFormation = newAIFormation;
+      if (subTarget) {
+        const subIn = findBestSubIn(aiBench, subTarget.preferPosition, aiLineup.find(p => p.id === subTarget.outId)?.position ?? 'M');
+        if (subIn) {
+          const outIdx = aiLineup.findIndex(p => p.id === subTarget.outId);
+          if (outIdx >= 0) {
+            newEvents.push({
+              id: `sub_${minute}_ai`, minute, type: 'sub',
+              teamId: aiIsHome ? homeTeam.id : awayTeam.id,
+              playerId: subTarget.outId, subInId: subIn.id,
+            });
+            const newLineup = [...aiLineup];
+            newLineup[outIdx] = subIn;
+            const newBench = aiBench.filter(p => p.id !== subIn.id);
+            if (aiIsHome) { s.homeLineup = newLineup; s.homeBench = newBench; s.homeSubs++; }
+            else { s.awayLineup = newLineup; s.awayBench = newBench; s.awaySubs++; }
+          }
+        }
+      }
+    }
+
+    // ── Resolve attacks ────────────────────────────────────────────────────
+    const resolveTeamAttack = (
+      attackers: Player[], defenders: Player[],
+      atkFormation: Formation, defFormation: Formation,
+      isAtkHome: boolean, atkTeamId: string,
+      atkScore: number, defScore: number,
+    ) => {
+      const homeAdv = getHomeAdvantage(isAtkHome);
+      const atkFm = FORMATION_MODIFIERS[atkFormation];
+      const defFm = FORMATION_MODIFIERS[defFormation];
+
+      const isUserAtk = atkTeamId === userTeamId;
+      const specAtk = isUserAtk ? userSpecAtk : 1.0;
+      const specDef = isUserAtk ? 1.0 : userSpecDef;
+
+      const midControl = computeMidfieldControl(attackers, defenders);
+      if (rand() < midControl) s.homePoss += isAtkHome ? 1 : 0;
+      else s.awayPoss += isAtkHome ? 0 : 1;
+
+      const momentum = computeMomentum(
+        atkScore, defScore, minute,
+        isAtkHome ? s.homeRecentGoal : s.awayRecentGoal,
+        isAtkHome ? s.homeRecentConceded : s.awayRecentConceded,
+      );
+      const deficit = defScore - atkScore;
+      const leaderBoost = computeLeadershipBoost(attackers, deficit, minute);
+
+      const gk = defenders.find(p => p.position === 'G') ?? null;
+      let boostedGk = gk;
+      if (gk && isUserAtk && gkBoost > 0) {
+        boostedGk = { ...gk, attributes: { ...gk.attributes, posicionamento: Math.min(99, gk.attributes.posicionamento + gkBoost * 2) } };
+      }
+
+      const outcome: AttackOutcome = resolveAttack({
+        attackers, defenders, goalkeeper: isUserAtk ? boostedGk : gk,
+        midfieldControl: midControl,
+        momentumBonus: momentum + leaderBoost,
+        homeAdvantage: homeAdv,
+        formationAtkMod: atkFm.attack, formationDefMod: defFm.defense,
+        specAtkMod: specAtk, specDefMod: specDef,
+        rand,
+      });
+
+      if (outcome.chanceCreated) {
+        if (isAtkHome) s.homeShots++; else s.awayShots++;
+      }
+
+      if (outcome.result === 'goal' && outcome.shooter) {
+        if (isAtkHome) { s.homeScore++; s.homeRecentGoal = minute; s.awayRecentConceded = minute; }
+        else { s.awayScore++; s.awayRecentGoal = minute; s.homeRecentConceded = minute; }
         newEvents.push({
-          id: `tc_${minute}`, minute, type: 'tactical_change',
-          teamId: aiIsHome ? homeTeam.id : awayTeam.id,
-          playerId: '', newFormation: newAIFormation,
+          id: `goal_${minute}_${atkTeamId}`, minute, type: 'goal',
+          teamId: atkTeamId, playerId: outcome.shooter.id,
+          assistId: outcome.assister?.id,
         });
       }
 
-      // ── AI substitutions (max 3) ──────────────────────────────────────
-      const aiLineup = aiIsHome ? s.homeLineup : s.awayLineup;
-      const aiBench = aiIsHome ? s.homeBench : s.awayBench;
-      const aiSubs = aiIsHome ? s.homeSubs : s.awaySubs;
-      const aiInjured = aiIsHome ? s.homeInjured : s.awayInjured;
+      // ── Set pieces ───────────────────────────────────────────────────────
+      const setPiece = checkSetPiece(attackers, defenders, outcome.chanceCreated, outcome.shotBlocked, rand);
 
-      if (aiSubs < 3 && minute > 45) {
-        const subTarget = getAISubstitutionTarget(
-          s.awayStyle, aiLineup, aiBench,
-          aiTeamScore, aiOppScore, minute, aiInjured,
-        );
-        if (subTarget) {
-          const subIn = findBestSubIn(aiBench, subTarget.preferPosition, aiLineup.find(p => p.id === subTarget.outId)?.position ?? 'M');
-          if (subIn) {
-            const outIdx = aiLineup.findIndex(p => p.id === subTarget.outId);
-            if (outIdx >= 0) {
-              newEvents.push({
-                id: `sub_${minute}_ai`, minute, type: 'sub',
-                teamId: aiIsHome ? homeTeam.id : awayTeam.id,
-                playerId: subTarget.outId, subInId: subIn.id,
-              });
-              const newLineup = [...aiLineup];
-              newLineup[outIdx] = subIn;
-              const newBench = aiBench.filter(p => p.id !== subIn.id);
-              if (aiIsHome) { s.homeLineup = newLineup; s.homeBench = newBench; s.homeSubs++; }
-              else { s.awayLineup = newLineup; s.awayBench = newBench; s.awaySubs++; }
-            }
-          }
+      if (setPiece.type === 'corner') {
+        newEvents.push({ id: `corner_${minute}_${atkTeamId}`, minute, type: 'corner', teamId: atkTeamId, playerId: '', setPieceType: 'corner' });
+        const cornerResult = resolveCorner(attackers, defenders, isUserAtk ? boostedGk : gk, rand);
+        if (isAtkHome) s.homeShots++; else s.awayShots++;
+        if (cornerResult.result === 'goal' && cornerResult.scorer) {
+          if (isAtkHome) { s.homeScore++; s.homeRecentGoal = minute; s.awayRecentConceded = minute; }
+          else { s.awayScore++; s.awayRecentGoal = minute; s.homeRecentConceded = minute; }
+          newEvents.push({ id: `spg_${minute}_${atkTeamId}`, minute, type: 'goal', teamId: atkTeamId, playerId: cornerResult.scorer.id, assistId: cornerResult.assister?.id, setPieceType: 'corner' });
         }
       }
 
-      // ── Resolve attacks with set pieces ────────────────────────────────
-
-      const resolveTeamAttack = (
-        attackers: Player[], defenders: Player[],
-        atkFormation: Formation, defFormation: Formation,
-        isAtkHome: boolean, atkTeamId: string,
-        atkScore: number, defScore: number,
-      ) => {
-        const homeAdv = getHomeAdvantage(isAtkHome);
-        const atkFm = FORMATION_MODIFIERS[atkFormation];
-        const defFm = FORMATION_MODIFIERS[defFormation];
-
-        // User spec modifiers
-        const isUserAtk = atkTeamId === userTeamId;
-        const specAtk = isUserAtk ? userSpecAtk : 1.0;
-        const specDef = isUserAtk ? 1.0 : userSpecDef;
-
-        // Midfield
-        const midControl = computeMidfieldControl(attackers, defenders);
-        if (rand() < midControl) s.homePoss += isAtkHome ? 1 : 0;
-        else s.awayPoss += isAtkHome ? 0 : 1;
-
-        // Momentum + leadership
-        const momentum = computeMomentum(
-          atkScore, defScore, minute,
-          isAtkHome ? s.homeRecentGoal : s.awayRecentGoal,
-          isAtkHome ? s.homeRecentConceded : s.awayRecentConceded,
-        );
-        const deficit = defScore - atkScore;
-        const leaderBoost = computeLeadershipBoost(attackers, deficit, minute);
-
-        const gk = defenders.find(p => p.position === 'G') ?? null;
-        // Apply GK staff boost if user's team
-        let boostedGk = gk;
-        if (gk && !isUserAtk && gkBoost > 0) {
-          // Don't boost opponent's GK
-        } else if (gk && isUserAtk && gkBoost > 0) {
-          boostedGk = { ...gk, attributes: { ...gk.attributes, posicionamento: Math.min(99, gk.attributes.posicionamento + gkBoost * 2) } };
-        }
-
-        // Main attack resolution
-        const outcome: AttackOutcome = resolveAttack({
-          attackers, defenders, goalkeeper: isUserAtk ? boostedGk : gk,
-          midfieldControl: midControl,
-          momentumBonus: momentum + leaderBoost,
-          homeAdvantage: homeAdv,
-          formationAtkMod: atkFm.attack, formationDefMod: defFm.defense,
-          specAtkMod: specAtk, specDefMod: specDef,
-          rand,
-        });
-
-        if (outcome.chanceCreated) {
-          if (isAtkHome) s.homeShots++; else s.awayShots++;
-        }
-
-        if (outcome.result === 'goal' && outcome.shooter) {
-          if (isAtkHome) {
-            s.homeScore++;
-            s.homeRecentGoal = minute;
-            s.awayRecentConceded = minute;
-          } else {
-            s.awayScore++;
-            s.awayRecentGoal = minute;
-            s.homeRecentConceded = minute;
-          }
-          newEvents.push({
-            id: `goal_${minute}_${atkTeamId}`, minute, type: 'goal',
-            teamId: atkTeamId, playerId: outcome.shooter.id,
-            assistId: outcome.assister?.id,
-          });
-        }
-
-        // ── SET PIECES ───────────────────────────────────────────────────
-        const setPiece = checkSetPiece(attackers, defenders, outcome.chanceCreated, outcome.shotBlocked, rand);
-
-        if (setPiece.type === 'corner') {
-          newEvents.push({ id: `corner_${minute}_${atkTeamId}`, minute, type: 'corner', teamId: atkTeamId, playerId: '', setPieceType: 'corner' });
-          const cornerResult = resolveCorner(attackers, defenders, isUserAtk ? boostedGk : gk, rand);
-          if (isAtkHome) s.homeShots++; else s.awayShots++;
-          if (cornerResult.result === 'goal' && cornerResult.scorer) {
-            if (isAtkHome) { s.homeScore++; s.homeRecentGoal = minute; s.awayRecentConceded = minute; }
-            else { s.awayScore++; s.awayRecentGoal = minute; s.homeRecentConceded = minute; }
-            newEvents.push({
-              id: `spg_${minute}_${atkTeamId}`, minute, type: 'goal',
-              teamId: atkTeamId, playerId: cornerResult.scorer.id,
-              assistId: cornerResult.assister?.id, setPieceType: 'corner',
-            });
-          }
-        }
-
-        if (setPiece.type === 'freekick') {
-          newEvents.push({ id: `fk_${minute}_${atkTeamId}`, minute, type: 'freekick', teamId: atkTeamId, playerId: setPiece.fouledPlayerId ?? '', setPieceType: 'freekick' });
-
-          // Card check on fouler
-          if (setPiece.foulingPlayerId) {
-            const fouler = defenders.find(p => p.id === setPiece.foulingPlayerId);
-            if (fouler) {
-              const defTeamId = isAtkHome ? awayTeam.id : homeTeam.id;
-              const cardChance = (100 - fouler.attributes.disciplina) / 800;
-              if (rand() < cardChance) {
-                const isRed = fouler.yellowCards >= 1 || rand() < 0.05;
-                newEvents.push({
-                  id: `card_${minute}_${fouler.id}`, minute,
-                  type: isRed ? 'red' : 'yellow',
-                  teamId: defTeamId, playerId: fouler.id,
-                });
-              }
-            }
-          }
-
-          const fkResult = resolveFreeKick(attackers, isUserAtk ? boostedGk : gk, rand);
-          if (isAtkHome) s.homeShots++; else s.awayShots++;
-          if (fkResult.result === 'goal' && fkResult.scorer) {
-            if (isAtkHome) { s.homeScore++; s.homeRecentGoal = minute; s.awayRecentConceded = minute; }
-            else { s.awayScore++; s.awayRecentGoal = minute; s.homeRecentConceded = minute; }
-            newEvents.push({
-              id: `spg_fk_${minute}_${atkTeamId}`, minute, type: 'goal',
-              teamId: atkTeamId, playerId: fkResult.scorer.id, setPieceType: 'freekick',
-            });
-          }
-        }
-
-        if (setPiece.type === 'penalty') {
-          newEvents.push({ id: `pen_${minute}_${atkTeamId}`, minute, type: 'penalty', teamId: atkTeamId, playerId: setPiece.fouledPlayerId ?? '', setPieceType: 'penalty' });
-
-          // Red/yellow card on fouler (penalty foul = harsher)
-          if (setPiece.foulingPlayerId) {
-            const fouler = defenders.find(p => p.id === setPiece.foulingPlayerId);
-            if (fouler) {
-              const defTeamId = isAtkHome ? awayTeam.id : homeTeam.id;
-              const isRed = rand() < 0.30; // 30% chance of red on penalty foul
-              newEvents.push({
-                id: `card_pen_${minute}_${fouler.id}`, minute,
-                type: isRed ? 'red' : 'yellow',
-                teamId: defTeamId, playerId: fouler.id,
-              });
-            }
-          }
-
-          const penResult = resolvePenalty(attackers, isUserAtk ? boostedGk : gk, rand);
-          if (isAtkHome) s.homeShots++; else s.awayShots++;
-          if (penResult.result === 'goal' && penResult.scorer) {
-            if (isAtkHome) { s.homeScore++; s.homeRecentGoal = minute; s.awayRecentConceded = minute; }
-            else { s.awayScore++; s.awayRecentGoal = minute; s.homeRecentConceded = minute; }
-            newEvents.push({
-              id: `spg_pen_${minute}_${atkTeamId}`, minute, type: 'goal',
-              teamId: atkTeamId, playerId: penResult.scorer.id, setPieceType: 'penalty',
-            });
-          } else if (penResult.result !== 'goal') {
-            newEvents.push({
-              id: `pm_${minute}_${atkTeamId}`, minute, type: 'penalty_miss',
-              teamId: atkTeamId, playerId: penResult.scorer?.id ?? '',
-            });
-          }
-        }
-
-        // ── Cards from regular play ──────────────────────────────────────
-        if (setPiece.type === null) {
-          for (const def of defenders.filter(p => p.position !== 'G')) {
-            const cardChance = (100 - def.attributes.disciplina) / 3000;
+      if (setPiece.type === 'freekick') {
+        newEvents.push({ id: `fk_${minute}_${atkTeamId}`, minute, type: 'freekick', teamId: atkTeamId, playerId: setPiece.fouledPlayerId ?? '', setPieceType: 'freekick' });
+        if (setPiece.foulingPlayerId) {
+          const fouler = defenders.find(p => p.id === setPiece.foulingPlayerId);
+          if (fouler) {
+            const defTeamId = isAtkHome ? awayTeam.id : homeTeam.id;
+            const cardChance = (100 - fouler.attributes.disciplina) / 800;
             if (rand() < cardChance) {
-              const defTeamId = isAtkHome ? awayTeam.id : homeTeam.id;
-              const isRed = def.yellowCards >= 1 || rand() < 0.03;
-              newEvents.push({
-                id: `card_${minute}_${def.id}`, minute,
-                type: isRed ? 'red' : 'yellow',
-                teamId: defTeamId, playerId: def.id,
-              });
+              const isRed = fouler.yellowCards >= 1 || rand() < 0.05;
+              newEvents.push({ id: `card_${minute}_${fouler.id}`, minute, type: isRed ? 'red' : 'yellow', teamId: defTeamId, playerId: fouler.id });
             }
           }
         }
+        const fkResult = resolveFreeKick(attackers, isUserAtk ? boostedGk : gk, rand);
+        if (isAtkHome) s.homeShots++; else s.awayShots++;
+        if (fkResult.result === 'goal' && fkResult.scorer) {
+          if (isAtkHome) { s.homeScore++; s.homeRecentGoal = minute; s.awayRecentConceded = minute; }
+          else { s.awayScore++; s.awayRecentGoal = minute; s.homeRecentConceded = minute; }
+          newEvents.push({ id: `spg_fk_${minute}_${atkTeamId}`, minute, type: 'goal', teamId: atkTeamId, playerId: fkResult.scorer.id, setPieceType: 'freekick' });
+        }
+      }
 
-        // ── Injuries ─────────────────────────────────────────────────────
-        const allPlayers = [...attackers, ...defenders];
-        for (const p of allPlayers) {
-          const injuryChance = 0.0008 * (1 - p.attributes.stamina / 200) * (minute > 70 ? 1.5 : 1.0);
-          if (rand() < injuryChance) {
-            const tId = attackers.includes(p) ? atkTeamId : (isAtkHome ? awayTeam.id : homeTeam.id);
-            newEvents.push({
-              id: `inj_${minute}_${p.id}`, minute, type: 'injury',
-              teamId: tId, playerId: p.id,
-            });
-            if (isAtkHome && attackers.includes(p)) s.homeInjured.push(p.id);
-            else if (isAtkHome && defenders.includes(p)) s.awayInjured.push(p.id);
-            else if (!isAtkHome && attackers.includes(p)) s.awayInjured.push(p.id);
-            else s.homeInjured.push(p.id);
+      if (setPiece.type === 'penalty') {
+        newEvents.push({ id: `pen_${minute}_${atkTeamId}`, minute, type: 'penalty', teamId: atkTeamId, playerId: setPiece.fouledPlayerId ?? '', setPieceType: 'penalty' });
+        if (setPiece.foulingPlayerId) {
+          const fouler = defenders.find(p => p.id === setPiece.foulingPlayerId);
+          if (fouler) {
+            const defTeamId = isAtkHome ? awayTeam.id : homeTeam.id;
+            const isRed = rand() < 0.30;
+            newEvents.push({ id: `card_pen_${minute}_${fouler.id}`, minute, type: isRed ? 'red' : 'yellow', teamId: defTeamId, playerId: fouler.id });
           }
         }
-      };
+        const penResult = resolvePenalty(attackers, isUserAtk ? boostedGk : gk, rand);
+        if (isAtkHome) s.homeShots++; else s.awayShots++;
+        if (penResult.result === 'goal' && penResult.scorer) {
+          if (isAtkHome) { s.homeScore++; s.homeRecentGoal = minute; s.awayRecentConceded = minute; }
+          else { s.awayScore++; s.awayRecentGoal = minute; s.homeRecentConceded = minute; }
+          newEvents.push({ id: `spg_pen_${minute}_${atkTeamId}`, minute, type: 'goal', teamId: atkTeamId, playerId: penResult.scorer.id, setPieceType: 'penalty' });
+        } else if (penResult.result !== 'goal') {
+          newEvents.push({ id: `pm_${minute}_${atkTeamId}`, minute, type: 'penalty_miss', teamId: atkTeamId, playerId: penResult.scorer?.id ?? '' });
+        }
+      }
 
-      // Home attacks
-      resolveTeamAttack(
-        s.homeLineup, s.awayLineup,
-        s.homeFormation, s.awayFormation,
-        true, homeTeam.id,
-        s.homeScore, s.awayScore,
-      );
+      // ── Cartões de jogo normal ──────────────────────────────────────────
+      if (setPiece.type === null) {
+        for (const def of defenders.filter(p => p.position !== 'G')) {
+          const cardChance = (100 - def.attributes.disciplina) / 3000;
+          if (rand() < cardChance) {
+            const defTeamId = isAtkHome ? awayTeam.id : homeTeam.id;
+            const isRed = def.yellowCards >= 1 || rand() < 0.03;
+            newEvents.push({ id: `card_${minute}_${def.id}`, minute, type: isRed ? 'red' : 'yellow', teamId: defTeamId, playerId: def.id });
+          }
+        }
+      }
 
-      // Away attacks
-      resolveTeamAttack(
-        s.awayLineup, s.homeLineup,
-        s.awayFormation, s.homeFormation,
-        false, awayTeam.id,
-        s.awayScore, s.homeScore,
-      );
+      // ── Lesões ──────────────────────────────────────────────────────────
+      const allMatchPlayers = [...attackers, ...defenders];
+      for (const p of allMatchPlayers) {
+        const injuryChance = 0.0008 * (1 - p.attributes.stamina / 200) * (minute > 70 ? 1.5 : 1.0);
+        if (rand() < injuryChance) {
+          const tId = attackers.includes(p) ? atkTeamId : (isAtkHome ? awayTeam.id : homeTeam.id);
+          newEvents.push({ id: `inj_${minute}_${p.id}`, minute, type: 'injury', teamId: tId, playerId: p.id });
+          if (isAtkHome && attackers.includes(p)) s.homeInjured.push(p.id);
+          else if (isAtkHome && defenders.includes(p)) s.awayInjured.push(p.id);
+          else if (!isAtkHome && attackers.includes(p)) s.awayInjured.push(p.id);
+          else s.homeInjured.push(p.id);
+        }
+      }
+    };
 
-      // Energy drain
-      const drainEnergy = (lineup: Player[]) =>
-        lineup.map(p => ({
-          ...p,
-          energy: Math.max(0, p.energy - (0.8 + (100 - p.attributes.stamina) / 200)),
-        }));
-      s.homeLineup = drainEnergy(s.homeLineup);
-      s.awayLineup = drainEnergy(s.awayLineup);
+    resolveTeamAttack(s.homeLineup, s.awayLineup, s.homeFormation, s.awayFormation, true, homeTeam.id, s.homeScore, s.awayScore);
+    resolveTeamAttack(s.awayLineup, s.homeLineup, s.awayFormation, s.homeFormation, false, awayTeam.id, s.awayScore, s.homeScore);
 
-      s.events = [...prev.events, ...newEvents];
+    // ── Desgaste de energia ──────────────────────────────────────────────
+    const drainEnergy = (lineup: Player[]) =>
+      lineup.map(p => ({ ...p, energy: Math.max(0, p.energy - (0.8 + (100 - p.attributes.stamina) / 200)) }));
+    s.homeLineup = drainEnergy(s.homeLineup);
+    s.awayLineup = drainEnergy(s.awayLineup);
 
-      if (minute >= 90) s.finished = true;
-      return s;
-    });
-  }, [isHome, homeTeam, awayTeam, userTeamId, userSpecAtk, userSpecDef, moraleMult, gkBoost]);
+    s.events = [...prev.events, ...newEvents];
 
-  // ── Game loop ──────────────────────────────────────────────────────────────
+    if (minute >= 90) s.finished = true;
+    return s;
+  }, [isHome, homeTeam, awayTeam, userTeamId, userSpecAtk, userSpecDef, gkBoost]);
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // GAME LOOP
+  // ══════════════════════════════════════════════════════════════════════════
 
   useEffect(() => {
     if (matchState.finished || paused) return;
+
     const speed = TICK_SPEEDS[speedIdx];
+
     if (speed === 0) {
-      // Instant: simulate all remaining ticks
-      const simulate = () => {
-        for (let i = matchState.minute; i < 90; i++) simulateTick();
-      };
-      simulate();
+      // ── INSTANT: simula todos os ticks restantes em JS puro ──────────────
+      // Sem chamar setMatchState dentro do loop — evita 90 re-renders.
+      // Aplica o resultado final com um único setState.
+      let current = matchStateRef.current;
+      while (!current.finished && current.minute < 90) {
+        current = applyTick(current);
+      }
+      setMatchState(current);
       return;
     }
-    const timer = setInterval(simulateTick, speed);
+
+    // ── NORMAL / RÁPIDO / ULTRA: um tick por intervalo ────────────────────
+    const timer = setInterval(() => {
+      setMatchState(prev => applyTick(prev));
+    }, speed);
+
     return () => clearInterval(timer);
-  }, [matchState.finished, paused, speedIdx, simulateTick]);
+  }, [matchState.finished, paused, speedIdx, applyTick]);
 
   // ── Finalizar ──────────────────────────────────────────────────────────────
-
   const handleFinish = useCallback(() => {
     const ms = matchStateRef.current;
 
-    // Build match report
     const goalEvents = ms.events.filter(e => e.type === 'goal').map(e => ({
       playerId: e.playerId, teamId: e.teamId, minute: e.minute,
       assistId: e.assistId, isSetPiece: !!e.setPieceType, setPieceType: e.setPieceType,
@@ -444,7 +388,6 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
 
     const totalPoss = ms.homePoss + ms.awayPoss || 1;
 
-    // Player ratings
     const ratingMap = new Map<string, number>();
     const allPlayed = [...ms.homeLineup, ...ms.awayLineup];
     for (const p of allPlayed) {
@@ -473,7 +416,6 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
       isCup: !!isCupMatch,
     };
 
-    // Player updates (energy, cards, goals, assists, minutes)
     const playerUpdates: Partial<Player>[] = [];
     for (const p of allPlayed) {
       const goals = goalEvents.filter(g => g.playerId === p.id).length;
@@ -497,7 +439,6 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
       });
     }
 
-    // Updated match
     const updatedMatches = matches.map(m =>
       m.id === userMatch.id
         ? { ...m, homeScore: ms.homeScore, awayScore: ms.awayScore, played: true }
@@ -507,7 +448,6 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
     onComplete(updatedMatches, playerUpdates, report);
   }, [matches, userMatch, homeTeam, awayTeam, onComplete, isCupMatch, gameState.staff.medico]);
 
-  // Auto-finish when 90 minutes
   useEffect(() => {
     if (matchState.finished) {
       const timer = setTimeout(handleFinish, 600);
@@ -516,7 +456,6 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
   }, [matchState.finished, handleFinish]);
 
   // ── Render ─────────────────────────────────────────────────────────────────
-
   const recentEvents = useMemo(() =>
     [...matchState.events].reverse().slice(0, 12),
     [matchState.events]
@@ -590,12 +529,9 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
             <span className="text-zinc-500 text-[10px] font-mono">90'</span>
           </div>
 
-          {/* Stats rápidas */}
+          {/* Stats */}
           <div className="grid grid-cols-3 gap-2 text-center text-[10px]">
-            <div>
-              <div className="font-bold text-xs">{matchState.homeShots}</div>
-              <div className="text-zinc-500">Chutes</div>
-            </div>
+            <div><div className="font-bold text-xs">{matchState.homeShots}</div><div className="text-zinc-500">Chutes</div></div>
             <div>
               <div className="flex items-center gap-1 justify-center">
                 <span className="font-bold text-xs">{homePossPercent}%</span>
@@ -607,10 +543,7 @@ export default function LiveMatchDay({ gameState, matches, userLineup, onComplet
                 <div className="bg-red-500 transition-all" style={{ width: `${100 - homePossPercent}%` }} />
               </div>
             </div>
-            <div>
-              <div className="font-bold text-xs">{matchState.awayShots}</div>
-              <div className="text-zinc-500">Chutes</div>
-            </div>
+            <div><div className="font-bold text-xs">{matchState.awayShots}</div><div className="text-zinc-500">Chutes</div></div>
           </div>
 
           {/* Formações */}
